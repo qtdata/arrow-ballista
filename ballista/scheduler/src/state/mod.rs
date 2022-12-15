@@ -51,7 +51,7 @@ pub mod execution_graph_dot;
 pub mod executor_manager;
 pub mod session_manager;
 pub mod session_registry;
-pub(crate) mod task_manager;
+pub mod task_manager;
 
 pub fn decode_protobuf<T: Message + Default>(bytes: &[u8]) -> Result<T> {
     T::decode(bytes).map_err(|e| {
@@ -88,9 +88,8 @@ pub fn encode_protobuf<T: Message + Default>(msg: &T) -> Result<Vec<u8>> {
 }
 
 #[derive(Clone)]
-pub(super) struct SchedulerState<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan>
-{
-    pub executor_manager: ExecutorManager,
+pub struct SchedulerState<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> {
+    pub(crate) executor_manager: ExecutorManager,
     pub task_manager: TaskManager<T, U>,
     pub session_manager: SessionManager,
     pub codec: BallistaCodec<T, U>,

@@ -62,7 +62,7 @@ pub(crate) type SessionBuilder = fn(SessionConfig) -> SessionState;
 pub struct SchedulerServer<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> {
     pub scheduler_name: String,
     pub start_time: u128,
-    pub(crate) state: Arc<SchedulerState<T, U>>,
+    pub state: Arc<SchedulerState<T, U>>,
     pub(crate) query_stage_event_loop: EventLoop<QueryStageSchedulerEvent>,
     query_stage_scheduler: Arc<QueryStageScheduler<T, U>>,
 }
@@ -187,7 +187,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerServer<T
         self.query_stage_scheduler.metrics_collector()
     }
 
-    pub(crate) async fn submit_job(
+    pub async fn submit_job(
         &self,
         job_id: &str,
         job_name: &str,
