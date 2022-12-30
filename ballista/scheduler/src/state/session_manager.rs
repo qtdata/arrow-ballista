@@ -164,6 +164,24 @@ fn propagate_ballista_configs(
                     ScalarValue::Boolean(Some(v.parse::<bool>().unwrap_or(true))),
                 )
             }
+            "datafusion.execution.parquet.enable_page_index" => {
+                config = config.set(
+                    k,
+                    ScalarValue::Boolean(Some(v.parse::<bool>().unwrap_or(true))),
+                )
+            }
+            "datafusion.execution.parquet.pushdown_filters" => {
+                config = config.set(
+                    k,
+                    ScalarValue::Boolean(Some(v.parse::<bool>().unwrap_or(true))),
+                )
+            }
+            "datafusion.execution.parquet.reorder_filters" => {
+                config = config.set(
+                    k,
+                    ScalarValue::Boolean(Some(v.parse::<bool>().unwrap_or(true))),
+                )
+            }
             _ => {
                 warn!("Ignoring unknown configuration option {} = {}", k, v);
             }
