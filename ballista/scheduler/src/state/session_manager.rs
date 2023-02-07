@@ -140,6 +140,11 @@ fn propagate_ballista_configs(
     for (k, v) in ballista_config.settings() {
         // see https://arrow.apache.org/datafusion/user-guide/configs.html for explanation of these configs
         match k.as_str() {
+            "datafusion.catalog.default_catalog"
+            | "datafusion.catalog.default_schema"
+            | "datafusion.execution.time_zone" => {
+                config = config.set(k, ScalarValue::Utf8(Some(v.to_string())))
+            }
             "datafusion.optimizer.filter_null_join_keys" => {
                 config = config.set(
                     k,
