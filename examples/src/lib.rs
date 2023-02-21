@@ -15,25 +15,4 @@
 // specific language governing permissions and limitations
 // under the License.
 
-/// Copied from https://github.com/apache/arrow-datafusion-python/pull/103
-
-use datafusion::arrow::datatypes::DataType;
-use pyo3::pyclass;
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
-#[pyclass(name = "PyDataType", module = "datafusion", subclass)]
-pub struct PyDataType {
-    pub(crate) data_type: DataType,
-}
-
-impl From<PyDataType> for DataType {
-    fn from(data_type: PyDataType) -> DataType {
-        data_type.data_type
-    }
-}
-
-impl From<DataType> for PyDataType {
-    fn from(data_type: DataType) -> PyDataType {
-        PyDataType { data_type }
-    }
-}
+pub mod test_util;
