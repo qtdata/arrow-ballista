@@ -16,17 +16,17 @@
 // under the License.
 
 use crate::cluster::{
-    reserve_slots_bias, reserve_slots_round_robin, ClusterState, ExecutorHeartbeatStream,
-    JobState, JobStateEvent, JobStateEventStream, JobStatus, TaskDistribution,
+    bind_task_bias, bind_task_consistent_hash, bind_task_round_robin,
+    is_skip_consistent_hash, BoundTask, ClusterState, ExecutorSlot, JobState,
+    JobStateEvent, JobStateEventStream, JobStatus, TaskDistributionPolicy, TopologyNode,
 };
 use crate::state::execution_graph::ExecutionGraph;
-use crate::state::executor_manager::ExecutorReservation;
 use async_trait::async_trait;
 use ballista_core::config::BallistaConfig;
 use ballista_core::error::{BallistaError, Result};
 use ballista_core::serde::protobuf::{
-    executor_status, AvailableTaskSlots, ExecutorHeartbeat, ExecutorStatus,
-    ExecutorTaskSlots, FailedJob, QueuedJob,
+    executor_status, AvailableTaskSlots, ExecutorHeartbeat, ExecutorStatus, FailedJob,
+    QueuedJob,
 };
 use ballista_core::serde::scheduler::{ExecutorData, ExecutorMetadata};
 use dashmap::DashMap;
@@ -35,42 +35,79 @@ use datafusion::prelude::SessionContext;
 use crate::cluster::event::ClusterEventSender;
 use crate::scheduler_server::{timestamp_millis, timestamp_secs, SessionBuilder};
 use crate::state::session_manager::create_datafusion_context;
+use crate::state::task_manager::JobInfoCache;
 use ballista_core::serde::protobuf::job_status::Status;
-use itertools::Itertools;
-use log::warn;
-use parking_lot::Mutex;
+use log::{error, info, warn};
 use std::collections::{HashMap, HashSet};
 use std::ops::DerefMut;
 
+use ballista_core::consistent_hash::node::Node;
+use datafusion::datasource::physical_plan::get_scan_files;
+use datafusion::physical_plan::ExecutionPlan;
 use std::sync::Arc;
+use tokio::sync::{Mutex, MutexGuard};
 use tracing::debug;
 
 #[derive(Default)]
 pub struct InMemoryClusterState {
     /// Current available task slots for each executor
-    task_slots: Mutex<ExecutorTaskSlots>,
+    task_slots: Mutex<HashMap<String, AvailableTaskSlots>>,
     /// Current executors
     executors: DashMap<String, ExecutorMetadata>,
     /// Last heartbeat received for each executor
     heartbeats: DashMap<String, ExecutorHeartbeat>,
-    /// Broadcast channel sender for heartbeats, If `None` there are not
-    /// subscribers
-    heartbeat_sender: ClusterEventSender<ExecutorHeartbeat>,
+}
+
+impl InMemoryClusterState {
+    /// Get the topology nodes of the cluster for consistent hashing
+    fn get_topology_nodes(
+        &self,
+        guard: &MutexGuard<HashMap<String, AvailableTaskSlots>>,
+        executors: Option<HashSet<String>>,
+    ) -> HashMap<String, TopologyNode> {
+        let mut nodes: HashMap<String, TopologyNode> = HashMap::new();
+        for (executor_id, slots) in guard.iter() {
+            if let Some(executors) = executors.as_ref() {
+                if !executors.contains(executor_id) {
+                    continue;
+                }
+            }
+            if let Some(executor) = self.executors.get(&slots.executor_id) {
+                let node = TopologyNode::new(
+                    &executor.host,
+                    executor.port,
+                    &slots.executor_id,
+                    self.heartbeats
+                        .get(&executor.id)
+                        .map(|heartbeat| heartbeat.timestamp)
+                        .unwrap_or(0),
+                    slots.slots,
+                );
+                if let Some(existing_node) = nodes.get(node.name()) {
+                    if existing_node.last_seen_ts < node.last_seen_ts {
+                        nodes.insert(node.name().to_string(), node);
+                    }
+                } else {
+                    nodes.insert(node.name().to_string(), node);
+                }
+            }
+        }
+        nodes
+    }
 }
 
 #[async_trait]
 impl ClusterState for InMemoryClusterState {
-    async fn reserve_slots(
+    async fn bind_schedulable_tasks(
         &self,
-        num_slots: u32,
-        distribution: TaskDistribution,
+        distribution: TaskDistributionPolicy,
+        active_jobs: Arc<HashMap<String, JobInfoCache>>,
         executors: Option<HashSet<String>>,
-    ) -> Result<Vec<ExecutorReservation>> {
-        let mut guard = self.task_slots.lock();
+    ) -> Result<Vec<BoundTask>> {
+        let mut guard = self.task_slots.lock().await;
 
-        let mut available_slots: Vec<&mut AvailableTaskSlots> = guard
-            .task_slots
-            .iter_mut()
+        let available_slots: Vec<&mut AvailableTaskSlots> = guard
+            .values_mut()
             .filter_map(|data| {
                 (data.slots > 0
                     && executors
@@ -81,76 +118,75 @@ impl ClusterState for InMemoryClusterState {
             })
             .collect();
 
-        available_slots.sort_by(|a, b| Ord::cmp(&b.slots, &a.slots));
-
-        let reservations = match distribution {
-            TaskDistribution::Bias => reserve_slots_bias(available_slots, num_slots),
-            TaskDistribution::RoundRobin => {
-                reserve_slots_round_robin(available_slots, num_slots)
+        let bound_tasks = match distribution {
+            TaskDistributionPolicy::Bias => {
+                bind_task_bias(available_slots, active_jobs, |_| false).await
+            }
+            TaskDistributionPolicy::RoundRobin => {
+                bind_task_round_robin(available_slots, active_jobs, |_| false).await
+            }
+            TaskDistributionPolicy::ConsistentHash {
+                num_replicas,
+                tolerance,
+            } => {
+                let mut bound_tasks = bind_task_round_robin(
+                    available_slots,
+                    active_jobs.clone(),
+                    |stage_plan: Arc<dyn ExecutionPlan>| {
+                        if let Ok(scan_files) = get_scan_files(stage_plan) {
+                            // Should be opposite to consistent hash ones.
+                            !is_skip_consistent_hash(&scan_files)
+                        } else {
+                            false
+                        }
+                    },
+                )
+                .await;
+                info!("{} tasks bound by round robin policy", bound_tasks.len());
+                let (bound_tasks_consistent_hash, ch_topology) =
+                    bind_task_consistent_hash(
+                        self.get_topology_nodes(&guard, executors),
+                        num_replicas,
+                        tolerance,
+                        active_jobs,
+                        |_, plan| get_scan_files(plan),
+                    )
+                    .await?;
+                info!(
+                    "{} tasks bound by consistent hashing policy",
+                    bound_tasks_consistent_hash.len()
+                );
+                if !bound_tasks_consistent_hash.is_empty() {
+                    bound_tasks.extend(bound_tasks_consistent_hash);
+                    // Update the available slots
+                    let ch_topology = ch_topology.unwrap();
+                    for node in ch_topology.nodes() {
+                        if let Some(data) = guard.get_mut(&node.id) {
+                            data.slots = node.available_slots;
+                        } else {
+                            error!("Fail to find executor data for {}", &node.id);
+                        }
+                    }
+                }
+                bound_tasks
             }
         };
 
-        Ok(reservations)
+        Ok(bound_tasks)
     }
 
-    async fn reserve_slots_exact(
-        &self,
-        num_slots: u32,
-        distribution: TaskDistribution,
-        executors: Option<HashSet<String>>,
-    ) -> Result<Vec<ExecutorReservation>> {
-        let mut guard = self.task_slots.lock();
-
-        let rollback = guard.clone();
-
-        let mut available_slots: Vec<&mut AvailableTaskSlots> = guard
-            .task_slots
-            .iter_mut()
-            .filter_map(|data| {
-                (data.slots > 0
-                    && executors
-                        .as_ref()
-                        .map(|executors| executors.contains(&data.executor_id))
-                        .unwrap_or(true))
-                .then_some(data)
-            })
-            .collect();
-
-        available_slots.sort_by(|a, b| Ord::cmp(&b.slots, &a.slots));
-
-        let reservations = match distribution {
-            TaskDistribution::Bias => reserve_slots_bias(available_slots, num_slots),
-            TaskDistribution::RoundRobin => {
-                reserve_slots_round_robin(available_slots, num_slots)
-            }
-        };
-
-        if reservations.len() as u32 != num_slots {
-            *guard = rollback;
-            Ok(vec![])
-        } else {
-            Ok(reservations)
-        }
-    }
-
-    async fn cancel_reservations(
-        &self,
-        reservations: Vec<ExecutorReservation>,
-    ) -> Result<()> {
+    async fn unbind_tasks(&self, executor_slots: Vec<ExecutorSlot>) -> Result<()> {
         let mut increments = HashMap::new();
-        for ExecutorReservation { executor_id, .. } in reservations {
-            if let Some(inc) = increments.get_mut(&executor_id) {
-                *inc += 1;
-            } else {
-                increments.insert(executor_id, 1usize);
-            }
+        for (executor_id, num_slots) in executor_slots {
+            let v = increments.entry(executor_id).or_insert_with(|| 0);
+            *v += num_slots;
         }
 
-        let mut guard = self.task_slots.lock();
+        let mut guard = self.task_slots.lock().await;
 
-        for executor_slots in guard.task_slots.iter_mut() {
-            if let Some(slots) = increments.get(&executor_slots.executor_id) {
-                executor_slots.slots += *slots as u32;
+        for (executor_id, num_slots) in increments {
+            if let Some(data) = guard.get_mut(&executor_id) {
+                data.slots += num_slots;
             }
         }
 
@@ -160,59 +196,32 @@ impl ClusterState for InMemoryClusterState {
     async fn register_executor(
         &self,
         metadata: ExecutorMetadata,
-        mut spec: ExecutorData,
-        reserve: bool,
-    ) -> Result<Vec<ExecutorReservation>> {
-        let heartbeat = ExecutorHeartbeat {
-            executor_id: metadata.id.clone(),
+        spec: ExecutorData,
+    ) -> Result<()> {
+        let executor_id = metadata.id.clone();
+
+        self.save_executor_metadata(metadata).await?;
+        self.save_executor_heartbeat(ExecutorHeartbeat {
+            executor_id: executor_id.clone(),
             timestamp: timestamp_secs(),
             metrics: vec![],
             status: Some(ExecutorStatus {
                 status: Some(executor_status::Status::Active(String::default())),
             }),
-        };
+        })
+        .await?;
 
-        let mut guard = self.task_slots.lock();
+        let mut guard = self.task_slots.lock().await;
 
-        // Check to see if we already have task slots for executor. If so, remove them.
-        if let Some((idx, _)) = guard
-            .task_slots
-            .iter()
-            .find_position(|slots| slots.executor_id == metadata.id)
-        {
-            guard.task_slots.swap_remove(idx);
-        }
-
-        if reserve {
-            let slots = std::mem::take(&mut spec.available_task_slots) as usize;
-
-            let reservations = (0..slots)
-                .into_iter()
-                .map(|_| ExecutorReservation::new_free(metadata.id.clone()))
-                .collect();
-
-            self.executors.insert(metadata.id.clone(), metadata.clone());
-
-            guard.task_slots.push(AvailableTaskSlots {
-                executor_id: metadata.id,
-                slots: 0,
-            });
-
-            self.heartbeat_sender.send(&heartbeat);
-
-            Ok(reservations)
-        } else {
-            self.executors.insert(metadata.id.clone(), metadata.clone());
-
-            guard.task_slots.push(AvailableTaskSlots {
-                executor_id: metadata.id,
+        guard.insert(
+            executor_id.clone(),
+            AvailableTaskSlots {
+                executor_id,
                 slots: spec.available_task_slots,
-            });
+            },
+        );
 
-            self.heartbeat_sender.send(&heartbeat);
-
-            Ok(vec![])
-        }
+        Ok(())
     }
 
     async fn save_executor_metadata(&self, metadata: ExecutorMetadata) -> Result<()> {
@@ -232,59 +241,37 @@ impl ClusterState for InMemoryClusterState {
     }
 
     async fn save_executor_heartbeat(&self, heartbeat: ExecutorHeartbeat) -> Result<()> {
-        if let Some(mut last) = self.heartbeats.get_mut(&heartbeat.executor_id) {
-            let _ = std::mem::replace(last.deref_mut(), heartbeat.clone());
+        let executor_id = heartbeat.executor_id.clone();
+        if let Some(mut last) = self.heartbeats.get_mut(&executor_id) {
+            let _ = std::mem::replace(last.deref_mut(), heartbeat);
         } else {
-            self.heartbeats
-                .insert(heartbeat.executor_id.clone(), heartbeat.clone());
+            self.heartbeats.insert(executor_id, heartbeat);
         }
-
-        self.heartbeat_sender.send(&heartbeat);
 
         Ok(())
     }
 
     async fn remove_executor(&self, executor_id: &str) -> Result<()> {
         {
-            let mut guard = self.task_slots.lock();
+            let mut guard = self.task_slots.lock().await;
 
-            if let Some((idx, _)) = guard
-                .task_slots
-                .iter()
-                .find_position(|slots| slots.executor_id == executor_id)
-            {
-                guard.task_slots.swap_remove(idx);
-            }
+            guard.remove(executor_id);
         }
 
-        if let Some(heartbeat) = self.heartbeats.get_mut(executor_id).as_deref_mut() {
-            let new_heartbeat = ExecutorHeartbeat {
-                executor_id: executor_id.to_string(),
-                timestamp: timestamp_secs(),
-                metrics: vec![],
-                status: Some(ExecutorStatus {
-                    status: Some(executor_status::Status::Dead(String::default())),
-                }),
-            };
-
-            *heartbeat = new_heartbeat;
-
-            self.heartbeat_sender.send(heartbeat);
-        }
+        self.heartbeats.remove(executor_id);
 
         Ok(())
     }
 
-    async fn executor_heartbeat_stream(&self) -> Result<ExecutorHeartbeatStream> {
-        Ok(Box::pin(self.heartbeat_sender.subscribe()))
-    }
-
-    async fn executor_heartbeats(&self) -> Result<HashMap<String, ExecutorHeartbeat>> {
-        Ok(self
-            .heartbeats
+    fn executor_heartbeats(&self) -> HashMap<String, ExecutorHeartbeat> {
+        self.heartbeats
             .iter()
             .map(|r| (r.key().clone(), r.value().clone()))
-            .collect())
+            .collect()
+    }
+
+    fn get_executor_heartbeat(&self, executor_id: &str) -> Option<ExecutorHeartbeat> {
+        self.heartbeats.get(executor_id).map(|r| r.value().clone())
     }
 }
 
@@ -324,7 +311,8 @@ impl InMemoryJobState {
 impl JobState for InMemoryJobState {
     async fn submit_job(&self, job_id: String, graph: &ExecutionGraph) -> Result<()> {
         if self.queued_jobs.get(&job_id).is_some() {
-            self.running_jobs.insert(job_id.clone(), graph.status());
+            self.running_jobs
+                .insert(job_id.clone(), graph.status().clone());
             self.queued_jobs.remove(&job_id);
 
             self.job_event_sender.send(&JobStateEvent::JobAcquired {
@@ -377,7 +365,7 @@ impl JobState for InMemoryJobState {
     }
 
     async fn save_job(&self, job_id: &str, graph: &ExecutionGraph) -> Result<()> {
-        let status = graph.status();
+        let status = graph.status().clone();
 
         debug!("saving state for job {job_id} with status {:?}", status);
 
@@ -390,7 +378,7 @@ impl JobState for InMemoryJobState {
                 .insert(job_id.to_string(), (status, Some(graph.clone())));
             self.running_jobs.remove(job_id);
         } else if let Some(old_status) =
-            self.running_jobs.insert(job_id.to_string(), graph.status())
+            self.running_jobs.insert(job_id.to_string(), status)
         {
             self.job_event_sender.send(&JobStateEvent::JobUpdated {
                 job_id: job_id.to_string(),
@@ -432,6 +420,13 @@ impl JobState for InMemoryJobState {
         Ok(session)
     }
 
+    async fn remove_session(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<Arc<SessionContext>>> {
+        Ok(self.sessions.remove(session_id).map(|(_key, value)| value))
+    }
+
     async fn job_state_events(&self) -> Result<JobStateEventStream> {
         Ok(Box::pin(self.job_event_sender.subscribe()))
     }
@@ -451,16 +446,15 @@ impl JobState for InMemoryJobState {
             .collect())
     }
 
-    async fn accept_job(
-        &self,
-        job_id: &str,
-        job_name: &str,
-        queued_at: u64,
-    ) -> Result<()> {
+    fn accept_job(&self, job_id: &str, job_name: &str, queued_at: u64) -> Result<()> {
         self.queued_jobs
             .insert(job_id.to_string(), (job_name.to_string(), queued_at));
 
         Ok(())
+    }
+
+    fn pending_job_number(&self) -> usize {
+        self.queued_jobs.len()
     }
 
     async fn fail_unscheduled_job(&self, job_id: &str, reason: String) -> Result<()> {
@@ -493,56 +487,13 @@ impl JobState for InMemoryJobState {
 
 #[cfg(test)]
 mod test {
-    use crate::cluster::memory::{InMemoryClusterState, InMemoryJobState};
-    use crate::cluster::test::{
-        test_executor_registration, test_fuzz_reservations, test_job_lifecycle,
-        test_job_planning_failure, test_reservation,
-    };
-    use crate::cluster::TaskDistribution;
+    use crate::cluster::memory::InMemoryJobState;
+    use crate::cluster::test_util::{test_job_lifecycle, test_job_planning_failure};
     use crate::test_utils::{
         test_aggregation_plan, test_join_plan, test_two_aggregations_plan,
     };
     use ballista_core::error::Result;
     use ballista_core::utils::default_session_builder;
-
-    #[tokio::test]
-    async fn test_in_memory_registration() -> Result<()> {
-        test_executor_registration(InMemoryClusterState::default()).await
-    }
-
-    #[tokio::test]
-    async fn test_in_memory_reserve() -> Result<()> {
-        test_reservation(InMemoryClusterState::default(), TaskDistribution::Bias).await?;
-        test_reservation(
-            InMemoryClusterState::default(),
-            TaskDistribution::RoundRobin,
-        )
-        .await?;
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_in_memory_fuzz_reserve() -> Result<()> {
-        test_fuzz_reservations(
-            InMemoryClusterState::default(),
-            10,
-            TaskDistribution::Bias,
-            10,
-            10,
-        )
-        .await?;
-        test_fuzz_reservations(
-            InMemoryClusterState::default(),
-            10,
-            TaskDistribution::RoundRobin,
-            10,
-            10,
-        )
-        .await?;
-
-        Ok(())
-    }
 
     #[tokio::test]
     async fn test_in_memory_job_lifecycle() -> Result<()> {

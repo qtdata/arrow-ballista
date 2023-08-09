@@ -20,124 +20,53 @@ use crate::error::{BallistaError, Result};
 use crate::execution_plans::{
     DistributedQueryExec, ShuffleWriterExec, UnresolvedShuffleExec,
 };
+use crate::object_store_registry::with_object_store_registry;
 use crate::serde::scheduler::PartitionStats;
+
 use async_trait::async_trait;
 use datafusion::arrow::datatypes::Schema;
 use datafusion::arrow::{ipc::writer::FileWriter, record_batch::RecordBatch};
-use datafusion::datasource::object_store::{ObjectStoreProvider, ObjectStoreRegistry};
+use datafusion::datasource::physical_plan::{CsvExec, ParquetExec};
 use datafusion::error::DataFusionError;
 use datafusion::execution::context::{
     QueryPlanner, SessionConfig, SessionContext, SessionState,
 };
 use datafusion::execution::runtime_env::{RuntimeConfig, RuntimeEnv};
-use datafusion::logical_expr::LogicalPlan;
+use datafusion::logical_expr::{DdlStatement, LogicalPlan};
 use datafusion::physical_plan::aggregates::AggregateExec;
 use datafusion::physical_plan::coalesce_batches::CoalesceBatchesExec;
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion::physical_plan::common::batch_byte_size;
 use datafusion::physical_plan::empty::EmptyExec;
-use datafusion::physical_plan::file_format::{CsvExec, ParquetExec};
 use datafusion::physical_plan::filter::FilterExec;
 use datafusion::physical_plan::joins::HashJoinExec;
 use datafusion::physical_plan::metrics::MetricsSet;
 use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::physical_plan::sorts::sort::SortExec;
 use datafusion::physical_plan::{metrics, ExecutionPlan, RecordBatchStream};
-#[cfg(any(feature = "hdfs", feature = "hdfs3"))]
-use datafusion_objectstore_hdfs::object_store::hdfs::HadoopFileSystem;
 use datafusion_proto::logical_plan::{
     AsLogicalPlan, DefaultLogicalExtensionCodec, LogicalExtensionCodec,
 };
 use futures::StreamExt;
 use log::error;
-#[cfg(feature = "s3")]
-use object_store::aws::AmazonS3Builder;
-#[cfg(feature = "azure")]
-use object_store::azure::MicrosoftAzureBuilder;
-use object_store::ObjectStore;
 use std::io::{BufWriter, Write};
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::{fs::File, pin::Pin};
 use tonic::codegen::StdError;
 use tonic::transport::{Channel, Error, Server};
-use url::Url;
 
 /// Default session builder using the provided configuration
 pub fn default_session_builder(config: SessionConfig) -> SessionState {
     SessionState::with_config_rt(
         config,
         Arc::new(
-            RuntimeEnv::new(with_object_store_provider(RuntimeConfig::default()))
+            RuntimeEnv::new(with_object_store_registry(RuntimeConfig::default()))
                 .unwrap(),
         ),
     )
-}
-
-/// Get a RuntimeConfig with specific ObjectStoreDetector in the ObjectStoreRegistry
-pub fn with_object_store_provider(config: RuntimeConfig) -> RuntimeConfig {
-    config.with_object_store_registry(Arc::new(ObjectStoreRegistry::new_with_provider(
-        Some(Arc::new(FeatureBasedObjectStoreProvider)),
-    )))
-}
-
-/// An object store detector based on which features are enable for different kinds of object stores
-pub struct FeatureBasedObjectStoreProvider;
-
-impl ObjectStoreProvider for FeatureBasedObjectStoreProvider {
-    /// Detector a suitable object store based on its url if possible
-    /// Return the key and object store
-    #[allow(unused_variables)]
-    fn get_by_url(&self, url: &Url) -> datafusion::error::Result<Arc<dyn ObjectStore>> {
-        #[cfg(any(feature = "hdfs", feature = "hdfs3"))]
-        {
-            let store = HadoopFileSystem::new(url.as_str());
-            if let Some(store) = store {
-                return Ok(Arc::new(store));
-            }
-        }
-
-        #[cfg(feature = "s3")]
-        {
-            if url.as_str().starts_with("s3://") {
-                if let Some(bucket_name) = url.host_str() {
-                    let store = AmazonS3Builder::from_env()
-                        .with_bucket_name(bucket_name)
-                        .build()?;
-                    return Ok(Arc::new(store));
-                }
-            // Support Alibaba Cloud OSS
-            // Use S3 compatibility mode to access Alibaba Cloud OSS
-            // The `AWS_ENDPOINT` should have bucket name included
-            } else if url.as_str().starts_with("oss://") {
-                if let Some(bucket_name) = url.host_str() {
-                    let store = AmazonS3Builder::from_env()
-                        .with_virtual_hosted_style_request(true)
-                        .with_bucket_name(bucket_name)
-                        .build()?;
-                    return Ok(Arc::new(store));
-                }
-            }
-        }
-
-        #[cfg(feature = "azure")]
-        {
-            if url.to_string().starts_with("azure://") {
-                if let Some(bucket_name) = url.host_str() {
-                    let store = MicrosoftAzureBuilder::from_env()
-                        .with_container_name(bucket_name)
-                        .build()?;
-                    return Ok(Arc::new(store));
-                }
-            }
-        }
-
-        Err(DataFusionError::Execution(format!(
-            "No object store available for {url}"
-        )))
-    }
 }
 
 /// Stream data to disk in Arrow IPC format
@@ -319,7 +248,7 @@ pub fn create_df_ctx_with_ballista_query_planner<T: 'static + AsLogicalPlan>(
     let mut session_state = SessionState::with_config_rt(
         session_config,
         Arc::new(
-            RuntimeEnv::new(with_object_store_provider(RuntimeConfig::default()))
+            RuntimeEnv::new(with_object_store_registry(RuntimeConfig::default()))
                 .unwrap(),
         ),
     )
@@ -382,7 +311,7 @@ impl<T: 'static + AsLogicalPlan> QueryPlanner for BallistaQueryPlanner<T> {
         session_state: &SessionState,
     ) -> std::result::Result<Arc<dyn ExecutionPlan>, DataFusionError> {
         match logical_plan {
-            LogicalPlan::CreateExternalTable(_) => {
+            LogicalPlan::Ddl(DdlStatement::CreateExternalTable(_)) => {
                 // table state is managed locally in the BallistaContext, not in the scheduler
                 Ok(Arc::new(EmptyExec::new(false, Arc::new(Schema::empty()))))
             }
@@ -438,4 +367,15 @@ pub fn collect_plan_metrics(plan: &dyn ExecutionPlan) -> Vec<MetricsSet> {
             .for_each(|e| metrics_array.push(e))
     });
     metrics_array
+}
+
+/// Given an interval in seconds, get the time in seconds before now
+pub fn get_time_before(interval_seconds: u64) -> u64 {
+    let now_epoch_ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("Time went backwards");
+    now_epoch_ts
+        .checked_sub(Duration::from_secs(interval_seconds))
+        .unwrap_or_else(|| Duration::from_secs(0))
+        .as_secs()
 }

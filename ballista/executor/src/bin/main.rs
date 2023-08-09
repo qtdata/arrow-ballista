@@ -18,6 +18,7 @@
 //! Ballista Rust executor binary.
 
 use anyhow::Result;
+use std::sync::Arc;
 
 use ballista_core::print_version;
 use ballista_executor::executor_process::{
@@ -77,7 +78,14 @@ async fn main() -> Result<()> {
         print_thread_info: opt.print_thread_info,
         job_data_ttl_seconds: opt.job_data_ttl_seconds,
         job_data_clean_up_interval_seconds: opt.job_data_clean_up_interval_seconds,
+        grpc_server_max_decoding_message_size: opt.grpc_server_max_decoding_message_size,
+        executor_heartbeat_interval_seconds: opt.executor_heartbeat_interval_seconds,
+        data_cache_policy: opt.data_cache_policy,
+        cache_dir: opt.cache_dir,
+        cache_capacity: opt.cache_capacity,
+        cache_io_concurrency: opt.cache_io_concurrency,
+        execution_engine: None,
     };
 
-    start_executor_process(config).await
+    start_executor_process(Arc::new(config)).await
 }

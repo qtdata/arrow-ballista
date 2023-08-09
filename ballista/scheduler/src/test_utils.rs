@@ -55,7 +55,6 @@ use datafusion::test_util::scan_empty;
 use crate::cluster::BallistaCluster;
 use crate::scheduler_server::event::QueryStageSchedulerEvent;
 
-use crate::scheduler_server::query_stage_scheduler::QueryStageScheduler;
 use crate::state::execution_graph::{ExecutionGraph, TaskDescription};
 use ballista_core::utils::default_session_builder;
 use datafusion_proto::protobuf::{LogicalPlanNode, PhysicalPlanNode};
@@ -151,51 +150,51 @@ pub fn get_tpch_schema(table: &str) -> Schema {
 
     match table {
         "part" => Schema::new(vec![
-            Field::new("p_partkey", DataType::Int32, false),
+            Field::new("p_partkey", DataType::Int64, false),
             Field::new("p_name", DataType::Utf8, false),
             Field::new("p_mfgr", DataType::Utf8, false),
             Field::new("p_brand", DataType::Utf8, false),
             Field::new("p_type", DataType::Utf8, false),
             Field::new("p_size", DataType::Int32, false),
             Field::new("p_container", DataType::Utf8, false),
-            Field::new("p_retailprice", DataType::Float64, false),
+            Field::new("p_retailprice", DataType::Decimal128(15, 2), false),
             Field::new("p_comment", DataType::Utf8, false),
         ]),
 
         "supplier" => Schema::new(vec![
-            Field::new("s_suppkey", DataType::Int32, false),
+            Field::new("s_suppkey", DataType::Int64, false),
             Field::new("s_name", DataType::Utf8, false),
             Field::new("s_address", DataType::Utf8, false),
-            Field::new("s_nationkey", DataType::Int32, false),
+            Field::new("s_nationkey", DataType::Int64, false),
             Field::new("s_phone", DataType::Utf8, false),
-            Field::new("s_acctbal", DataType::Float64, false),
+            Field::new("s_acctbal", DataType::Decimal128(15, 2), false),
             Field::new("s_comment", DataType::Utf8, false),
         ]),
 
         "partsupp" => Schema::new(vec![
-            Field::new("ps_partkey", DataType::Int32, false),
-            Field::new("ps_suppkey", DataType::Int32, false),
+            Field::new("ps_partkey", DataType::Int64, false),
+            Field::new("ps_suppkey", DataType::Int64, false),
             Field::new("ps_availqty", DataType::Int32, false),
-            Field::new("ps_supplycost", DataType::Float64, false),
+            Field::new("ps_supplycost", DataType::Decimal128(15, 2), false),
             Field::new("ps_comment", DataType::Utf8, false),
         ]),
 
         "customer" => Schema::new(vec![
-            Field::new("c_custkey", DataType::Int32, false),
+            Field::new("c_custkey", DataType::Int64, false),
             Field::new("c_name", DataType::Utf8, false),
             Field::new("c_address", DataType::Utf8, false),
-            Field::new("c_nationkey", DataType::Int32, false),
+            Field::new("c_nationkey", DataType::Int64, false),
             Field::new("c_phone", DataType::Utf8, false),
-            Field::new("c_acctbal", DataType::Float64, false),
+            Field::new("c_acctbal", DataType::Decimal128(15, 2), false),
             Field::new("c_mktsegment", DataType::Utf8, false),
             Field::new("c_comment", DataType::Utf8, false),
         ]),
 
         "orders" => Schema::new(vec![
-            Field::new("o_orderkey", DataType::Int32, false),
-            Field::new("o_custkey", DataType::Int32, false),
+            Field::new("o_orderkey", DataType::Int64, false),
+            Field::new("o_custkey", DataType::Int64, false),
             Field::new("o_orderstatus", DataType::Utf8, false),
-            Field::new("o_totalprice", DataType::Float64, false),
+            Field::new("o_totalprice", DataType::Decimal128(15, 2), false),
             Field::new("o_orderdate", DataType::Date32, false),
             Field::new("o_orderpriority", DataType::Utf8, false),
             Field::new("o_clerk", DataType::Utf8, false),
@@ -204,14 +203,14 @@ pub fn get_tpch_schema(table: &str) -> Schema {
         ]),
 
         "lineitem" => Schema::new(vec![
-            Field::new("l_orderkey", DataType::Int32, false),
-            Field::new("l_partkey", DataType::Int32, false),
-            Field::new("l_suppkey", DataType::Int32, false),
+            Field::new("l_orderkey", DataType::Int64, false),
+            Field::new("l_partkey", DataType::Int64, false),
+            Field::new("l_suppkey", DataType::Int64, false),
             Field::new("l_linenumber", DataType::Int32, false),
-            Field::new("l_quantity", DataType::Float64, false),
-            Field::new("l_extendedprice", DataType::Float64, false),
-            Field::new("l_discount", DataType::Float64, false),
-            Field::new("l_tax", DataType::Float64, false),
+            Field::new("l_quantity", DataType::Decimal128(15, 2), false),
+            Field::new("l_extendedprice", DataType::Decimal128(15, 2), false),
+            Field::new("l_discount", DataType::Decimal128(15, 2), false),
+            Field::new("l_tax", DataType::Decimal128(15, 2), false),
             Field::new("l_returnflag", DataType::Utf8, false),
             Field::new("l_linestatus", DataType::Utf8, false),
             Field::new("l_shipdate", DataType::Date32, false),
@@ -223,14 +222,14 @@ pub fn get_tpch_schema(table: &str) -> Schema {
         ]),
 
         "nation" => Schema::new(vec![
-            Field::new("n_nationkey", DataType::Int32, false),
+            Field::new("n_nationkey", DataType::Int64, false),
             Field::new("n_name", DataType::Utf8, false),
-            Field::new("n_regionkey", DataType::Int32, false),
+            Field::new("n_regionkey", DataType::Int64, false),
             Field::new("n_comment", DataType::Utf8, false),
         ]),
 
         "region" => Schema::new(vec![
-            Field::new("r_regionkey", DataType::Int32, false),
+            Field::new("r_regionkey", DataType::Int64, false),
             Field::new("r_name", DataType::Utf8, false),
             Field::new("r_comment", DataType::Utf8, false),
         ]),
@@ -270,15 +269,8 @@ pub fn default_task_runner() -> impl TaskRunner {
     TaskRunnerFn::new(|executor_id: String, task: MultiTaskDefinition| {
         let mut statuses = vec![];
 
-        let partitions =
-            if let Some(output_partitioning) = task.output_partitioning.as_ref() {
-                output_partitioning.partition_count as usize
-            } else {
-                1
-            };
-
+        let partitions = 1;
         let partitions: Vec<ShuffleWritePartition> = (0..partitions)
-            .into_iter()
             .map(|i| ShuffleWritePartition {
                 partition_id: i as u64,
                 path: String::default(),
@@ -409,7 +401,6 @@ impl SchedulerTest {
         let runner = runner.unwrap_or_else(|| Arc::new(default_task_runner()));
 
         let executors: HashMap<String, VirtualExecutor> = (0..num_executors)
-            .into_iter()
             .map(|i| {
                 let id = format!("virtual-executor-{i}");
                 let executor = VirtualExecutor {
@@ -433,7 +424,7 @@ impl SchedulerTest {
                 "localhost:50050".to_owned(),
                 cluster,
                 BallistaCodec::default(),
-                config,
+                Arc::new(config),
                 metrics_collector,
                 Arc::new(launcher),
             );
@@ -459,7 +450,7 @@ impl SchedulerTest {
             scheduler
                 .state
                 .executor_manager
-                .register_executor(metadata, executor_data, false)
+                .register_executor(metadata, executor_data)
                 .await?;
         }
 
@@ -470,8 +461,12 @@ impl SchedulerTest {
         })
     }
 
-    pub fn pending_tasks(&self) -> usize {
-        self.scheduler.pending_tasks()
+    pub fn pending_job_number(&self) -> usize {
+        self.scheduler.pending_job_number()
+    }
+
+    pub fn running_job_number(&self) -> usize {
+        self.scheduler.running_job_number()
     }
 
     pub async fn ctx(&self) -> Result<Arc<SessionContext>> {
@@ -663,12 +658,6 @@ impl SchedulerTest {
 
         final_status
     }
-
-    pub(crate) fn query_stage_scheduler(
-        &self,
-    ) -> Arc<QueryStageScheduler<LogicalPlanNode, PhysicalPlanNode>> {
-        self.scheduler.query_stage_scheduler()
-    }
 }
 
 #[derive(Clone)]
@@ -794,6 +783,13 @@ pub fn assert_failed_event(job_id: &str, collector: &TestMetricsCollector) {
 }
 
 pub async fn test_aggregation_plan(partition: usize) -> ExecutionGraph {
+    test_aggregation_plan_with_job_id(partition, "job").await
+}
+
+pub async fn test_aggregation_plan_with_job_id(
+    partition: usize,
+    job_id: &str,
+) -> ExecutionGraph {
     let config = SessionConfig::new().with_target_partitions(partition);
     let ctx = Arc::new(SessionContext::with_config(config));
     let session_state = ctx.state();
@@ -817,9 +813,12 @@ pub async fn test_aggregation_plan(partition: usize) -> ExecutionGraph {
         .await
         .unwrap();
 
-    println!("{}", DisplayableExecutionPlan::new(plan.as_ref()).indent());
+    println!(
+        "{}",
+        DisplayableExecutionPlan::new(plan.as_ref()).indent(false)
+    );
 
-    ExecutionGraph::new("localhost:50050", "job", "", "session", plan, 0).unwrap()
+    ExecutionGraph::new("localhost:50050", job_id, "", "session", plan, 0).unwrap()
 }
 
 pub async fn test_two_aggregations_plan(partition: usize) -> ExecutionGraph {
@@ -849,7 +848,10 @@ pub async fn test_two_aggregations_plan(partition: usize) -> ExecutionGraph {
         .await
         .unwrap();
 
-    println!("{}", DisplayableExecutionPlan::new(plan.as_ref()).indent());
+    println!(
+        "{}",
+        DisplayableExecutionPlan::new(plan.as_ref()).indent(false)
+    );
 
     ExecutionGraph::new("localhost:50050", "job", "", "session", plan, 0).unwrap()
 }
@@ -884,7 +886,7 @@ pub async fn test_coalesce_plan(partition: usize) -> ExecutionGraph {
 pub async fn test_join_plan(partition: usize) -> ExecutionGraph {
     let mut config = SessionConfig::new().with_target_partitions(partition);
     config
-        .config_options_mut()
+        .options_mut()
         .optimizer
         .enable_round_robin_repartition = false;
     let ctx = Arc::new(SessionContext::with_config(config));
@@ -907,7 +909,7 @@ pub async fn test_join_plan(partition: usize) -> ExecutionGraph {
     let logical_plan = left_plan
         .join(right_plan, JoinType::Inner, (vec!["id"], vec!["id"]), None)
         .unwrap()
-        .aggregate(vec![col("id")], vec![sum(col("gmv"))])
+        .aggregate(vec![col("left.id")], vec![sum(col("left.gmv"))])
         .unwrap()
         .sort(vec![sort_expr])
         .unwrap()
@@ -921,7 +923,10 @@ pub async fn test_join_plan(partition: usize) -> ExecutionGraph {
         .await
         .unwrap();
 
-    println!("{}", DisplayableExecutionPlan::new(plan.as_ref()).indent());
+    println!(
+        "{}",
+        DisplayableExecutionPlan::new(plan.as_ref()).indent(false)
+    );
 
     let graph =
         ExecutionGraph::new("localhost:50050", "job", "", "session", plan, 0).unwrap();
@@ -950,7 +955,10 @@ pub async fn test_union_all_plan(partition: usize) -> ExecutionGraph {
         .await
         .unwrap();
 
-    println!("{}", DisplayableExecutionPlan::new(plan.as_ref()).indent());
+    println!(
+        "{}",
+        DisplayableExecutionPlan::new(plan.as_ref()).indent(false)
+    );
 
     let graph =
         ExecutionGraph::new("localhost:50050", "job", "", "session", plan, 0).unwrap();
@@ -979,7 +987,10 @@ pub async fn test_union_plan(partition: usize) -> ExecutionGraph {
         .await
         .unwrap();
 
-    println!("{}", DisplayableExecutionPlan::new(plan.as_ref()).indent());
+    println!(
+        "{}",
+        DisplayableExecutionPlan::new(plan.as_ref()).indent(false)
+    );
 
     let graph =
         ExecutionGraph::new("localhost:50050", "job", "", "session", plan, 0).unwrap();
@@ -1002,10 +1013,7 @@ pub fn mock_executor(executor_id: String) -> ExecutorMetadata {
 pub fn mock_completed_task(task: TaskDescription, executor_id: &str) -> TaskStatus {
     let mut partitions: Vec<protobuf::ShuffleWritePartition> = vec![];
 
-    let num_partitions = task
-        .output_partitioning
-        .map(|p| p.partition_count())
-        .unwrap_or(1);
+    let num_partitions = task.get_output_partition_number();
 
     for partition_id in 0..num_partitions {
         partitions.push(protobuf::ShuffleWritePartition {
@@ -1043,10 +1051,7 @@ pub fn mock_completed_task(task: TaskDescription, executor_id: &str) -> TaskStat
 pub fn mock_failed_task(task: TaskDescription, failed_task: FailedTask) -> TaskStatus {
     let mut partitions: Vec<protobuf::ShuffleWritePartition> = vec![];
 
-    let num_partitions = task
-        .output_partitioning
-        .map(|p| p.partition_count())
-        .unwrap_or(1);
+    let num_partitions = task.get_output_partition_number();
 
     for partition_id in 0..num_partitions {
         partitions.push(protobuf::ShuffleWritePartition {

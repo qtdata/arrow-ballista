@@ -33,11 +33,11 @@ use datafusion::arrow::error::ArrowError;
 use datafusion::arrow::ipc::reader::FileReader;
 use datafusion::arrow::record_batch::RecordBatch;
 
-use datafusion::error::{DataFusionError, Result};
+use datafusion::error::Result;
 use datafusion::physical_plan::expressions::PhysicalSortExpr;
 use datafusion::physical_plan::metrics::{ExecutionPlanMetricsSet, MetricsSet};
 use datafusion::physical_plan::{
-    DisplayFormatType, ExecutionPlan, Partitioning, RecordBatchStream,
+    DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, RecordBatchStream,
     SendableRecordBatchStream, Statistics,
 };
 use futures::{Stream, StreamExt, TryStreamExt};
@@ -58,9 +58,11 @@ use tokio_stream::wrappers::ReceiverStream;
 /// being executed by an executor
 #[derive(Debug, Clone)]
 pub struct ShuffleReaderExec {
+    /// The query stage id to read from
+    pub stage_id: usize,
+    pub(crate) schema: SchemaRef,
     /// Each partition of a shuffle can read data from multiple locations
     pub partition: Vec<Vec<PartitionLocation>>,
-    pub(crate) schema: SchemaRef,
     /// Execution metrics
     metrics: ExecutionPlanMetricsSet,
 }
@@ -68,14 +70,30 @@ pub struct ShuffleReaderExec {
 impl ShuffleReaderExec {
     /// Create a new ShuffleReaderExec
     pub fn try_new(
+        stage_id: usize,
         partition: Vec<Vec<PartitionLocation>>,
         schema: SchemaRef,
     ) -> Result<Self> {
         Ok(Self {
-            partition,
+            stage_id,
             schema,
+            partition,
             metrics: ExecutionPlanMetricsSet::new(),
         })
+    }
+}
+
+impl DisplayAs for ShuffleReaderExec {
+    fn fmt_as(
+        &self,
+        t: DisplayFormatType,
+        f: &mut std::fmt::Formatter,
+    ) -> std::fmt::Result {
+        match t {
+            DisplayFormatType::Default | DisplayFormatType::Verbose => {
+                write!(f, "ShuffleReaderExec: partitions={}", self.partition.len())
+            }
+        }
     }
 }
 
@@ -106,9 +124,11 @@ impl ExecutionPlan for ShuffleReaderExec {
         self: Arc<Self>,
         _children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        Err(DataFusionError::Plan(
-            "Ballista ShuffleReaderExec does not support with_new_children()".to_owned(),
-        ))
+        Ok(Arc::new(ShuffleReaderExec::try_new(
+            self.stage_id,
+            self.partition.clone(),
+            self.schema.clone(),
+        )?))
     }
 
     fn execute(
@@ -146,18 +166,6 @@ impl ExecutionPlan for ShuffleReaderExec {
             response_receiver.try_flatten(),
         );
         Ok(Box::pin(result))
-    }
-
-    fn fmt_as(
-        &self,
-        t: DisplayFormatType,
-        f: &mut std::fmt::Formatter,
-    ) -> std::fmt::Result {
-        match t {
-            DisplayFormatType::Default => {
-                write!(f, "ShuffleReaderExec: partitions={}", self.partition.len())
-            }
-        }
     }
 
     fn metrics(&self) -> Option<MetricsSet> {
@@ -428,6 +436,7 @@ mod tests {
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use datafusion::arrow::ipc::writer::FileWriter;
     use datafusion::arrow::record_batch::RecordBatch;
+    use datafusion::common::DataFusionError;
     use datafusion::physical_expr::expressions::Column;
     use datafusion::physical_plan::common;
     use datafusion::physical_plan::memory::MemoryExec;
@@ -513,13 +522,14 @@ mod tests {
         ]);
 
         let job_id = "test_job_1";
+        let input_stage_id = 2;
         let mut partitions: Vec<PartitionLocation> = vec![];
         for partition_id in 0..4 {
             partitions.push(PartitionLocation {
                 map_partition_id: 0,
                 partition_id: PartitionId {
                     job_id: job_id.to_string(),
-                    stage_id: 2,
+                    stage_id: input_stage_id,
                     partition_id,
                 },
                 executor_meta: ExecutorMetadata {
@@ -534,8 +544,11 @@ mod tests {
             })
         }
 
-        let shuffle_reader_exec =
-            ShuffleReaderExec::try_new(vec![partitions], Arc::new(schema))?;
+        let shuffle_reader_exec = ShuffleReaderExec::try_new(
+            input_stage_id,
+            vec![partitions],
+            Arc::new(schema),
+        )?;
         let mut stream = shuffle_reader_exec.execute(0, task_ctx)?;
         let batches = utils::collect_stream(&mut stream).await;
 
@@ -637,7 +650,6 @@ mod tests {
 
     fn get_test_partition_locations(n: usize, path: String) -> Vec<PartitionLocation> {
         (0..n)
-            .into_iter()
             .map(|partition_id| PartitionLocation {
                 map_partition_id: 0,
                 partition_id: PartitionId {

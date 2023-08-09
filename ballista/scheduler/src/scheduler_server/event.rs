@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::state::executor_manager::ExecutorReservation;
+use std::fmt::{Debug, Formatter};
 
 use datafusion::logical_expr::LogicalPlan;
 
@@ -37,7 +37,6 @@ pub enum QueryStageSchedulerEvent {
         job_id: String,
         queued_at: u64,
         submitted_at: u64,
-        resubmit: bool,
     },
     // For a job which failed during planning
     JobPlanningFailed {
@@ -62,7 +61,75 @@ pub enum QueryStageSchedulerEvent {
     JobCancel(String),
     JobDataClean(String),
     TaskUpdating(String, Vec<TaskStatus>),
-    ReservationOffering(Vec<ExecutorReservation>),
+    ReviveOffers,
     ExecutorLost(String, Option<String>),
     CancelTasks(Vec<RunningTaskInfo>),
+}
+
+impl Debug for QueryStageSchedulerEvent {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            QueryStageSchedulerEvent::JobQueued {
+                job_id, job_name, ..
+            } => {
+                write!(f, "JobQueued : job_id={job_id}, job_name={job_name}.")
+            }
+            QueryStageSchedulerEvent::JobSubmitted { job_id, .. } => {
+                write!(f, "JobSubmitted : job_id={job_id}.")
+            }
+            QueryStageSchedulerEvent::JobPlanningFailed {
+                job_id,
+                fail_message,
+                queued_at,
+                failed_at,
+            } => {
+                write!(
+                    f,
+                    "JobPlanningFailed : job_id={job_id}, fail_message={fail_message}, queued_at={queued_at}, failed_at={failed_at}.",
+                )
+            }
+            QueryStageSchedulerEvent::JobFinished {
+                job_id,
+                queued_at,
+                completed_at,
+            } => {
+                write!(
+                    f,
+                    "JobFinished : job_id={job_id}, queued_at={queued_at}, completed_at={completed_at}.",
+                )
+            }
+            QueryStageSchedulerEvent::JobRunningFailed {
+                job_id,
+                fail_message,
+                queued_at,
+                failed_at,
+            } => {
+                write!(
+                    f,
+                    "JobRunningFailed : job_id={job_id}, fail_message={fail_message}, queued_at={queued_at}, failed_at={failed_at}.",
+                )
+            }
+            QueryStageSchedulerEvent::JobUpdated(job_id) => {
+                write!(f, "JobUpdated : job_id={job_id}.")
+            }
+            QueryStageSchedulerEvent::JobCancel(job_id) => {
+                write!(f, "JobCancel : job_id={job_id}.")
+            }
+            QueryStageSchedulerEvent::JobDataClean(job_id) => {
+                write!(f, "JobDataClean : job_id={job_id}.")
+            }
+            QueryStageSchedulerEvent::TaskUpdating(job_id, status) => {
+                write!(f, "TaskUpdating : job_id={job_id}, status:[{status:?}].")
+            }
+            QueryStageSchedulerEvent::ReviveOffers => {
+                write!(f, "ReviveOffers.")
+            }
+            QueryStageSchedulerEvent::ExecutorLost(job_id, reason) => {
+                write!(f, "ExecutorLost : job_id={job_id}, reason:[{reason:?}].")
+            }
+            QueryStageSchedulerEvent::CancelTasks(status) => {
+                write!(f, "CancelTasks : status:[{status:?}].")
+            }
+        }
+    }
 }

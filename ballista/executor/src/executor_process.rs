@@ -20,7 +20,7 @@
 use std::net::SocketAddr;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 use std::{env, io};
 
 use anyhow::{Context, Result};
@@ -40,8 +40,15 @@ use uuid::Uuid;
 use datafusion::execution::runtime_env::{RuntimeConfig, RuntimeEnv};
 use datafusion_proto::protobuf::{LogicalPlanNode, PhysicalPlanNode};
 
-use ballista_core::config::{LogRotationPolicy, TaskSchedulingPolicy};
+#[cfg(not(windows))]
+use ballista_core::cache_layer::{
+    medium::local_disk::LocalDiskMedium, policy::file::FileCacheLayer, CacheLayer,
+};
+use ballista_core::config::{DataCachePolicy, LogRotationPolicy, TaskSchedulingPolicy};
 use ballista_core::error::BallistaError;
+#[cfg(not(windows))]
+use ballista_core::object_store_registry::cache::CachedBasedObjectStoreRegistry;
+use ballista_core::object_store_registry::with_object_store_registry;
 use ballista_core::serde::protobuf::executor_resource::Resource;
 use ballista_core::serde::protobuf::executor_status::Status;
 use ballista_core::serde::protobuf::{
@@ -51,10 +58,11 @@ use ballista_core::serde::protobuf::{
 };
 use ballista_core::serde::BallistaCodec;
 use ballista_core::utils::{
-    create_grpc_client_connection, create_grpc_server, with_object_store_provider,
+    create_grpc_client_connection, create_grpc_server, get_time_before,
 };
 use ballista_core::BALLISTA_VERSION;
 
+use crate::execution_engine::ExecutionEngine;
 use crate::executor::{Executor, TasksDrainedFuture};
 use crate::executor_server::TERMINATING;
 use crate::flight_service::BallistaFlightService;
@@ -82,13 +90,24 @@ pub struct ExecutorProcessConfig {
     pub log_rotation_policy: LogRotationPolicy,
     pub job_data_ttl_seconds: u64,
     pub job_data_clean_up_interval_seconds: u64,
+    pub data_cache_policy: Option<DataCachePolicy>,
+    pub cache_dir: Option<String>,
+    pub cache_capacity: u64,
+    pub cache_io_concurrency: u32,
+    /// The maximum size of a decoded message at the grpc server side.
+    pub grpc_server_max_decoding_message_size: u32,
+    pub executor_heartbeat_interval_seconds: u64,
+    /// Optional execution engine to use to execute physical plans, will default to
+    /// DataFusion if none is provided.
+    pub execution_engine: Option<Arc<dyn ExecutionEngine>>,
 }
 
-pub async fn start_executor_process(opt: ExecutorProcessConfig) -> Result<()> {
+pub async fn start_executor_process(opt: Arc<ExecutorProcessConfig>) -> Result<()> {
     let rust_log = env::var(EnvFilter::DEFAULT_ENV);
-    let log_filter = EnvFilter::new(rust_log.unwrap_or(opt.special_mod_log_level));
+    let log_filter =
+        EnvFilter::new(rust_log.unwrap_or(opt.special_mod_log_level.clone()));
     // File layer
-    if let Some(log_dir) = opt.log_dir {
+    if let Some(log_dir) = opt.log_dir.clone() {
         let log_file = match opt.log_rotation_policy {
             LogRotationPolicy::Minutely => {
                 tracing_appender::rolling::minutely(log_dir, &opt.log_file_name_prefix)
@@ -104,7 +123,7 @@ pub async fn start_executor_process(opt: ExecutorProcessConfig) -> Result<()> {
             }
         };
         tracing_subscriber::fmt()
-            .with_ansi(true)
+            .with_ansi(false)
             .with_thread_names(opt.print_thread_info)
             .with_thread_ids(opt.print_thread_info)
             .with_writer(log_file)
@@ -113,7 +132,7 @@ pub async fn start_executor_process(opt: ExecutorProcessConfig) -> Result<()> {
     } else {
         // Console layer
         tracing_subscriber::fmt()
-            .with_ansi(true)
+            .with_ansi(false)
             .with_thread_names(opt.print_thread_info)
             .with_thread_ids(opt.print_thread_info)
             .with_writer(io::stdout)
@@ -126,11 +145,11 @@ pub async fn start_executor_process(opt: ExecutorProcessConfig) -> Result<()> {
         .parse()
         .with_context(|| format!("Could not parse address: {addr}"))?;
 
-    let scheduler_host = opt.scheduler_host;
+    let scheduler_host = opt.scheduler_host.clone();
     let scheduler_port = opt.scheduler_port;
     let scheduler_url = format!("http://{scheduler_host}:{scheduler_port}");
 
-    let work_dir = opt.work_dir.unwrap_or(
+    let work_dir = opt.work_dir.clone().unwrap_or(
         TempDir::new()?
             .into_path()
             .into_os_string()
@@ -166,12 +185,49 @@ pub async fn start_executor_process(opt: ExecutorProcessConfig) -> Result<()> {
         }),
     };
 
-    let config = with_object_store_provider(
-        RuntimeConfig::new().with_temp_file_path(work_dir.clone()),
-    );
-    let runtime = Arc::new(RuntimeEnv::new(config).map_err(|_| {
-        BallistaError::Internal("Failed to init Executor RuntimeEnv".to_owned())
-    })?);
+    let config = RuntimeConfig::new().with_temp_file_path(work_dir.clone());
+    let runtime = {
+        let config = with_object_store_registry(config.clone());
+        Arc::new(RuntimeEnv::new(config).map_err(|_| {
+            BallistaError::Internal("Failed to init Executor RuntimeEnv".to_owned())
+        })?)
+    };
+
+    // Set the object store registry
+    #[cfg(not(windows))]
+    let runtime_with_data_cache = {
+        let cache_dir = opt.cache_dir.clone();
+        let cache_capacity = opt.cache_capacity;
+        let cache_io_concurrency = opt.cache_io_concurrency;
+        let cache_layer =
+            opt.data_cache_policy
+                .map(|data_cache_policy| match data_cache_policy {
+                    DataCachePolicy::LocalDiskFile => {
+                        let cache_dir = cache_dir.unwrap();
+                        let cache_layer = FileCacheLayer::new(
+                            cache_capacity as usize,
+                            cache_io_concurrency,
+                            LocalDiskMedium::new(cache_dir),
+                        );
+                        CacheLayer::LocalDiskFile(Arc::new(cache_layer))
+                    }
+                });
+        if let Some(cache_layer) = cache_layer {
+            let registry = Arc::new(CachedBasedObjectStoreRegistry::new(
+                runtime.object_store_registry.clone(),
+                cache_layer,
+            ));
+            Some(Arc::new(RuntimeEnv {
+                memory_pool: runtime.memory_pool.clone(),
+                disk_manager: runtime.disk_manager.clone(),
+                object_store_registry: registry,
+            }))
+        } else {
+            None
+        }
+    };
+    #[cfg(windows)]
+    let runtime_with_data_cache = { None };
 
     let metrics_collector = Arc::new(LoggingMetricsCollector::default());
 
@@ -179,8 +235,10 @@ pub async fn start_executor_process(opt: ExecutorProcessConfig) -> Result<()> {
         executor_meta,
         &work_dir,
         runtime,
+        runtime_with_data_cache,
         metrics_collector,
         concurrent_tasks,
+        opt.execution_engine.clone(),
     ));
 
     let connect_timeout = opt.scheduler_connect_timeout_seconds as u64;
@@ -276,7 +334,7 @@ pub async fn start_executor_process(opt: ExecutorProcessConfig) -> Result<()> {
                 //If there is executor registration error during startup, return the error and stop early.
                 executor_server::startup(
                     scheduler.clone(),
-                    opt.bind_host,
+                    opt.clone(),
                     executor.clone(),
                     default_codec,
                     stop_send,
@@ -507,11 +565,7 @@ async fn clean_all_shuffle_data(work_dir: &str) -> Result<()> {
 /// Determines if a directory contains files newer than the cutoff time.
 /// If return true, it means the directory contains files newer than the cutoff time. It satisfy the ttl and should not be deleted.
 pub async fn satisfy_dir_ttl(dir: DirEntry, ttl_seconds: u64) -> Result<bool> {
-    let cutoff = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("Time went backwards")
-        .checked_sub(Duration::from_secs(ttl_seconds))
-        .expect("The cut off time went backwards");
+    let cutoff = get_time_before(ttl_seconds);
 
     let mut to_check = vec![dir];
     while let Some(dir) = to_check.pop() {
@@ -522,6 +576,7 @@ pub async fn satisfy_dir_ttl(dir: DirEntry, ttl_seconds: u64) -> Result<bool> {
             .modified()?
             .duration_since(UNIX_EPOCH)
             .expect("Time went backwards")
+            .as_secs()
             > cutoff
         {
             return Ok(true);
@@ -536,6 +591,7 @@ pub async fn satisfy_dir_ttl(dir: DirEntry, ttl_seconds: u64) -> Result<bool> {
                 .modified()?
                 .duration_since(UNIX_EPOCH)
                 .expect("Time went backwards")
+                .as_secs()
                 > cutoff
             {
                 return Ok(true);

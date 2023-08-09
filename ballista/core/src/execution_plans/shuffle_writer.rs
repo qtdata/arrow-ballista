@@ -47,7 +47,8 @@ use datafusion::physical_plan::metrics::{
 };
 
 use datafusion::physical_plan::{
-    DisplayFormatType, ExecutionPlan, Partitioning, SendableRecordBatchStream, Statistics,
+    DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, SendableRecordBatchStream,
+    Statistics,
 };
 use futures::{StreamExt, TryFutureExt, TryStreamExt};
 
@@ -71,7 +72,8 @@ pub struct ShuffleWriterExec {
     plan: Arc<dyn ExecutionPlan>,
     /// Path to write output streams to
     work_dir: String,
-    /// Optional shuffle output partitioning
+    /// Optional shuffle output partitioning.
+    /// If it's none, it means there's no need to do repartitioning.
     shuffle_output_partitioning: Option<Partitioning>,
     /// Execution metrics
     metrics: ExecutionPlanMetricsSet,
@@ -132,6 +134,11 @@ impl ShuffleWriterExec {
     /// Get the Stage ID for this query stage
     pub fn stage_id(&self) -> usize {
         self.stage_id
+    }
+
+    /// Get the input partition count
+    pub fn input_partition_count(&self) -> usize {
+        self.plan.output_partitioning().partition_count()
     }
 
     /// Get the true output partitioning
@@ -288,6 +295,24 @@ impl ShuffleWriterExec {
     }
 }
 
+impl DisplayAs for ShuffleWriterExec {
+    fn fmt_as(
+        &self,
+        t: DisplayFormatType,
+        f: &mut std::fmt::Formatter,
+    ) -> std::fmt::Result {
+        match t {
+            DisplayFormatType::Default | DisplayFormatType::Verbose => {
+                write!(
+                    f,
+                    "ShuffleWriterExec: {:?}",
+                    self.shuffle_output_partitioning
+                )
+            }
+        }
+    }
+}
+
 impl ExecutionPlan for ShuffleWriterExec {
     fn as_any(&self) -> &dyn Any {
         self
@@ -297,12 +322,12 @@ impl ExecutionPlan for ShuffleWriterExec {
         self.plan.schema()
     }
 
+    /// If [`shuffle_output_partitioning`] is none, then there's no need to do repartitioning.
+    /// Therefore, the partition is the same as its input plan's.
     fn output_partitioning(&self) -> Partitioning {
-        // This operator needs to be executed once for each *input* partition and there
-        // isn't really a mechanism yet in DataFusion to support this use case so we report
-        // the input partitioning as the output partitioning here. The executor reports
-        // output partition meta data back to the scheduler.
-        self.plan.output_partitioning()
+        self.shuffle_output_partitioning
+            .clone()
+            .unwrap_or_else(|| self.plan.output_partitioning())
     }
 
     fn output_ordering(&self) -> Option<&[PhysicalSortExpr]> {
@@ -391,22 +416,6 @@ impl ExecutionPlan for ShuffleWriterExec {
 
     fn metrics(&self) -> Option<MetricsSet> {
         Some(self.metrics.clone_inner())
-    }
-
-    fn fmt_as(
-        &self,
-        t: DisplayFormatType,
-        f: &mut std::fmt::Formatter,
-    ) -> std::fmt::Result {
-        match t {
-            DisplayFormatType::Default => {
-                write!(
-                    f,
-                    "ShuffleWriterExec: {:?}",
-                    self.shuffle_output_partitioning
-                )
-            }
-        }
     }
 
     fn statistics(&self) -> Statistics {

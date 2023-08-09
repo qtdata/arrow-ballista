@@ -26,22 +26,21 @@ use datafusion::physical_optimizer::join_selection::JoinSelection;
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::physical_plan::display::DisplayableExecutionPlan;
 use datafusion::physical_plan::metrics::{MetricValue, MetricsSet};
-use datafusion::physical_plan::{ExecutionPlan, Metric, Partitioning};
+use datafusion::physical_plan::{ExecutionPlan, Metric};
 use datafusion::prelude::{SessionConfig, SessionContext};
 use datafusion_proto::logical_plan::AsLogicalPlan;
 use log::{debug, warn};
 
 use ballista_core::error::{BallistaError, Result};
+use ballista_core::execution_plans::ShuffleWriterExec;
 use ballista_core::serde::protobuf::failed_task::FailedReason;
 use ballista_core::serde::protobuf::{
     self, task_info, FailedTask, GraphStageInput, OperatorMetricsSet, ResultLost,
     SuccessfulTask, TaskStatus,
 };
 use ballista_core::serde::protobuf::{task_status, RunningTask};
-use ballista_core::serde::scheduler::to_proto::hash_partitioning_to_proto;
 use ballista_core::serde::scheduler::PartitionLocation;
 use ballista_core::serde::BallistaCodec;
-use datafusion_proto::physical_plan::from_proto::parse_protobuf_hash_partitioning;
 use datafusion_proto::physical_plan::AsExecutionPlan;
 
 use crate::display::DisplayableBallistaExecutionPlan;
@@ -107,8 +106,6 @@ pub(crate) struct UnresolvedStage {
     pub(crate) stage_id: usize,
     /// Stage Attempt number
     pub(crate) stage_attempt_num: usize,
-    /// Output partitioning for this stage.
-    pub(crate) output_partitioning: Option<Partitioning>,
     /// Stage ID of the stage that will take this stages outputs as inputs.
     /// If `output_links` is empty then this the final stage in the `ExecutionGraph`
     pub(crate) output_links: Vec<usize>,
@@ -132,8 +129,6 @@ pub(crate) struct ResolvedStage {
     /// Total number of partitions for this stage.
     /// This stage will produce on task for partition.
     pub(crate) partitions: usize,
-    /// Output partitioning for this stage.
-    pub(crate) output_partitioning: Option<Partitioning>,
     /// Stage ID of the stage that will take this stages outputs as inputs.
     /// If `output_links` is empty then this the final stage in the `ExecutionGraph`
     pub(crate) output_links: Vec<usize>,
@@ -159,8 +154,6 @@ pub(crate) struct RunningStage {
     /// Total number of partitions for this stage.
     /// This stage will produce on task for partition.
     pub(crate) partitions: usize,
-    /// Output partitioning for this stage.
-    pub(crate) output_partitioning: Option<Partitioning>,
     /// Stage ID of the stage that will take this stages outputs as inputs.
     /// If `output_links` is empty then this the final stage in the `ExecutionGraph`
     pub(crate) output_links: Vec<usize>,
@@ -188,8 +181,6 @@ pub(crate) struct SuccessfulStage {
     /// Total number of partitions for this stage.
     /// This stage will produce on task for partition.
     pub(crate) partitions: usize,
-    /// Output partitioning for this stage.
-    pub(crate) output_partitioning: Option<Partitioning>,
     /// Stage ID of the stage that will take this stages outputs as inputs.
     /// If `output_links` is empty then this the final stage in the `ExecutionGraph`
     pub(crate) output_links: Vec<usize>,
@@ -214,8 +205,6 @@ pub(crate) struct FailedStage {
     /// Total number of partitions for this stage.
     /// This stage will produce on task for partition.
     pub(crate) partitions: usize,
-    /// Output partitioning for this stage.
-    pub(crate) output_partitioning: Option<Partitioning>,
     /// Stage ID of the stage that will take this stages outputs as inputs.
     /// If `output_links` is empty then this the final stage in the `ExecutionGraph`
     pub(crate) output_links: Vec<usize>,
@@ -252,7 +241,6 @@ impl UnresolvedStage {
     pub(super) fn new(
         stage_id: usize,
         plan: Arc<dyn ExecutionPlan>,
-        output_partitioning: Option<Partitioning>,
         output_links: Vec<usize>,
         child_stage_ids: Vec<usize>,
     ) -> Self {
@@ -264,7 +252,6 @@ impl UnresolvedStage {
         Self {
             stage_id,
             stage_attempt_num: 0,
-            output_partitioning,
             output_links,
             inputs,
             plan,
@@ -276,7 +263,6 @@ impl UnresolvedStage {
         stage_id: usize,
         stage_attempt_num: usize,
         plan: Arc<dyn ExecutionPlan>,
-        output_partitioning: Option<Partitioning>,
         output_links: Vec<usize>,
         inputs: HashMap<usize, StageOutput>,
         last_attempt_failure_reasons: HashSet<String>,
@@ -284,7 +270,6 @@ impl UnresolvedStage {
         Self {
             stage_id,
             stage_attempt_num,
-            output_partitioning,
             output_links,
             inputs,
             plan,
@@ -365,14 +350,12 @@ impl UnresolvedStage {
 
         // Optimize join order based on new resolved statistics
         let optimize_join = JoinSelection::new();
-        let plan =
-            optimize_join.optimize(plan, SessionConfig::default().config_options())?;
+        let plan = optimize_join.optimize(plan, SessionConfig::default().options())?;
 
         Ok(ResolvedStage::new(
             self.stage_id,
             self.stage_attempt_num,
             plan,
-            self.output_partitioning.clone(),
             self.output_links.clone(),
             self.inputs.clone(),
             self.last_attempt_failure_reasons.clone(),
@@ -391,18 +374,11 @@ impl UnresolvedStage {
             codec.physical_extension_codec(),
         )?;
 
-        let output_partitioning: Option<Partitioning> = parse_protobuf_hash_partitioning(
-            stage.output_partitioning.as_ref(),
-            session_ctx,
-            plan.schema().as_ref(),
-        )?;
-
         let inputs = decode_inputs(stage.inputs)?;
 
         Ok(UnresolvedStage {
             stage_id: stage.stage_id as usize,
             stage_attempt_num: stage.stage_attempt_num as usize,
-            output_partitioning,
             output_links: stage.output_links.into_iter().map(|l| l as usize).collect(),
             plan,
             inputs,
@@ -422,13 +398,9 @@ impl UnresolvedStage {
 
         let inputs = encode_inputs(stage.inputs)?;
 
-        let output_partitioning =
-            hash_partitioning_to_proto(stage.output_partitioning.as_ref())?;
-
         Ok(protobuf::UnResolvedStage {
             stage_id: stage.stage_id as u32,
             stage_attempt_num: stage.stage_attempt_num as u32,
-            output_partitioning,
             output_links: stage.output_links.into_iter().map(|l| l as u32).collect(),
             inputs,
             plan,
@@ -441,7 +413,7 @@ impl UnresolvedStage {
 
 impl Debug for UnresolvedStage {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        let plan = DisplayableExecutionPlan::new(self.plan.as_ref()).indent();
+        let plan = DisplayableExecutionPlan::new(self.plan.as_ref()).indent(false);
 
         write!(
             f,
@@ -460,18 +432,16 @@ impl ResolvedStage {
         stage_id: usize,
         stage_attempt_num: usize,
         plan: Arc<dyn ExecutionPlan>,
-        output_partitioning: Option<Partitioning>,
         output_links: Vec<usize>,
         inputs: HashMap<usize, StageOutput>,
         last_attempt_failure_reasons: HashSet<String>,
     ) -> Self {
-        let partitions = plan.output_partitioning().partition_count();
+        let partitions = get_stage_partitions(plan.clone());
 
         Self {
             stage_id,
             stage_attempt_num,
             partitions,
-            output_partitioning,
             output_links,
             inputs,
             plan,
@@ -486,7 +456,6 @@ impl ResolvedStage {
             self.stage_attempt_num,
             self.plan.clone(),
             self.partitions,
-            self.output_partitioning.clone(),
             self.output_links.clone(),
             self.inputs.clone(),
         )
@@ -500,7 +469,6 @@ impl ResolvedStage {
             self.stage_id,
             self.stage_attempt_num,
             new_plan,
-            self.output_partitioning.clone(),
             self.output_links.clone(),
             self.inputs.clone(),
             self.last_attempt_failure_reasons.clone(),
@@ -520,19 +488,12 @@ impl ResolvedStage {
             codec.physical_extension_codec(),
         )?;
 
-        let output_partitioning: Option<Partitioning> = parse_protobuf_hash_partitioning(
-            stage.output_partitioning.as_ref(),
-            session_ctx,
-            plan.schema().as_ref(),
-        )?;
-
         let inputs = decode_inputs(stage.inputs)?;
 
         Ok(ResolvedStage {
             stage_id: stage.stage_id as usize,
             stage_attempt_num: stage.stage_attempt_num as usize,
             partitions: stage.partitions as usize,
-            output_partitioning,
             output_links: stage.output_links.into_iter().map(|l| l as usize).collect(),
             inputs,
             plan,
@@ -550,16 +511,12 @@ impl ResolvedStage {
         U::try_from_physical_plan(stage.plan, codec.physical_extension_codec())
             .and_then(|proto| proto.try_encode(&mut plan))?;
 
-        let output_partitioning =
-            hash_partitioning_to_proto(stage.output_partitioning.as_ref())?;
-
         let inputs = encode_inputs(stage.inputs)?;
 
         Ok(protobuf::ResolvedStage {
             stage_id: stage.stage_id as u32,
             stage_attempt_num: stage.stage_attempt_num as u32,
             partitions: stage.partitions as u32,
-            output_partitioning,
             output_links: stage.output_links.into_iter().map(|l| l as u32).collect(),
             inputs,
             plan,
@@ -572,7 +529,7 @@ impl ResolvedStage {
 
 impl Debug for ResolvedStage {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        let plan = DisplayableExecutionPlan::new(self.plan.as_ref()).indent();
+        let plan = DisplayableExecutionPlan::new(self.plan.as_ref()).indent(false);
 
         write!(
             f,
@@ -588,7 +545,6 @@ impl RunningStage {
         stage_attempt_num: usize,
         plan: Arc<dyn ExecutionPlan>,
         partitions: usize,
-        output_partitioning: Option<Partitioning>,
         output_links: Vec<usize>,
         inputs: HashMap<usize, StageOutput>,
     ) -> Self {
@@ -596,7 +552,6 @@ impl RunningStage {
             stage_id,
             stage_attempt_num,
             partitions,
-            output_partitioning,
             output_links,
             inputs,
             plan,
@@ -628,7 +583,6 @@ impl RunningStage {
             stage_id: self.stage_id,
             stage_attempt_num: self.stage_attempt_num,
             partitions: self.partitions,
-            output_partitioning: self.output_partitioning.clone(),
             output_links: self.output_links.clone(),
             inputs: self.inputs.clone(),
             plan: self.plan.clone(),
@@ -642,7 +596,6 @@ impl RunningStage {
             stage_id: self.stage_id,
             stage_attempt_num: self.stage_attempt_num,
             partitions: self.partitions,
-            output_partitioning: self.output_partitioning.clone(),
             output_links: self.output_links.clone(),
             plan: self.plan.clone(),
             task_infos: self.task_infos.clone(),
@@ -657,7 +610,6 @@ impl RunningStage {
             self.stage_id,
             self.stage_attempt_num + 1,
             self.plan.clone(),
-            self.output_partitioning.clone(),
             self.output_links.clone(),
             self.inputs.clone(),
             HashSet::new(),
@@ -675,7 +627,6 @@ impl RunningStage {
             self.stage_id,
             self.stage_attempt_num + 1,
             new_plan,
-            self.output_partitioning.clone(),
             self.output_links.clone(),
             self.inputs.clone(),
             failure_reasons,
@@ -786,7 +737,12 @@ impl RunningStage {
         partition: usize,
         metrics: Vec<OperatorMetricsSet>,
     ) -> Result<()> {
-        if let Some(combined_metrics) = &mut self.stage_metrics {
+        // For some cases, task metrics not set, especially for testings.
+        if metrics.is_empty() {
+            return Ok(());
+        }
+
+        let new_metrics_set = if let Some(combined_metrics) = &mut self.stage_metrics {
             if metrics.len() != combined_metrics.len() {
                 return Err(BallistaError::Internal(format!("Error updating task metrics to stage {}, task metrics array size {} does not equal \
                 with the stage metrics array size {} for task {}", self.stage_id, metrics.len(), combined_metrics.len(), partition)));
@@ -801,23 +757,21 @@ impl RunningStage {
                 })
                 .collect::<Result<Vec<_>>>()?;
 
-            let new_metrics_set = combined_metrics
+            combined_metrics
                 .iter_mut()
                 .zip(metrics_values_array)
                 .map(|(first, second)| {
                     Self::combine_metrics_set(first, second, partition)
                 })
-                .collect();
-            self.stage_metrics = Some(new_metrics_set)
+                .collect()
         } else {
-            let new_metrics_set = metrics
+            metrics
                 .into_iter()
                 .map(|ms| ms.try_into())
-                .collect::<Result<Vec<_>>>()?;
-            if !new_metrics_set.is_empty() {
-                self.stage_metrics = Some(new_metrics_set)
-            }
-        }
+                .collect::<Result<Vec<_>>>()?
+        };
+        self.stage_metrics = Some(new_metrics_set);
+
         Ok(())
     }
 
@@ -906,7 +860,7 @@ impl RunningStage {
 
 impl Debug for RunningStage {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        let plan = DisplayableExecutionPlan::new(self.plan.as_ref()).indent();
+        let plan = DisplayableExecutionPlan::new(self.plan.as_ref()).indent(false);
 
         write!(
             f,
@@ -935,18 +889,22 @@ impl SuccessfulStage {
                 _ => task_infos.push(None),
             }
         }
+        let stage_metrics = if self.stage_metrics.is_empty() {
+            None
+        } else {
+            Some(self.stage_metrics.clone())
+        };
         RunningStage {
             stage_id: self.stage_id,
             stage_attempt_num: self.stage_attempt_num + 1,
             partitions: self.partitions,
-            output_partitioning: self.output_partitioning.clone(),
             output_links: self.output_links.clone(),
             inputs: self.inputs.clone(),
             plan: self.plan.clone(),
             task_infos,
             // It is Ok to forget the previous task failure attempts
             task_failure_numbers: vec![0; self.partitions],
-            stage_metrics: Some(self.stage_metrics.clone()),
+            stage_metrics,
         }
     }
 
@@ -1000,12 +958,6 @@ impl SuccessfulStage {
             codec.physical_extension_codec(),
         )?;
 
-        let output_partitioning: Option<Partitioning> = parse_protobuf_hash_partitioning(
-            stage.output_partitioning.as_ref(),
-            session_ctx,
-            plan.schema().as_ref(),
-        )?;
-
         let inputs = decode_inputs(stage.inputs)?;
         assert_eq!(
             stage.task_infos.len(),
@@ -1023,7 +975,6 @@ impl SuccessfulStage {
             stage_id: stage.stage_id as usize,
             stage_attempt_num: stage.stage_attempt_num as usize,
             partitions: stage.partitions as usize,
-            output_partitioning,
             output_links: stage.output_links.into_iter().map(|l| l as usize).collect(),
             inputs,
             plan,
@@ -1043,9 +994,6 @@ impl SuccessfulStage {
         U::try_from_physical_plan(stage.plan, codec.physical_extension_codec())
             .and_then(|proto| proto.try_encode(&mut plan))?;
 
-        let output_partitioning =
-            hash_partitioning_to_proto(stage.output_partitioning.as_ref())?;
-
         let inputs = encode_inputs(stage.inputs)?;
         let task_infos = stage
             .task_infos
@@ -1064,7 +1012,6 @@ impl SuccessfulStage {
             stage_id: stage_id as u32,
             stage_attempt_num: stage.stage_attempt_num as u32,
             partitions: stage.partitions as u32,
-            output_partitioning,
             output_links: stage.output_links.into_iter().map(|l| l as u32).collect(),
             inputs,
             plan,
@@ -1130,12 +1077,6 @@ impl FailedStage {
             codec.physical_extension_codec(),
         )?;
 
-        let output_partitioning: Option<Partitioning> = parse_protobuf_hash_partitioning(
-            stage.output_partitioning.as_ref(),
-            session_ctx,
-            plan.schema().as_ref(),
-        )?;
-
         let mut task_infos: Vec<Option<TaskInfo>> = vec![None; stage.partitions as usize];
         for info in stage.task_infos {
             task_infos[info.partition_id as usize] = Some(decode_taskinfo(info.clone()));
@@ -1156,7 +1097,6 @@ impl FailedStage {
             stage_id: stage.stage_id as usize,
             stage_attempt_num: stage.stage_attempt_num as usize,
             partitions: stage.partitions as usize,
-            output_partitioning,
             output_links: stage.output_links.into_iter().map(|l| l as usize).collect(),
             plan,
             task_infos,
@@ -1175,9 +1115,6 @@ impl FailedStage {
         let mut plan: Vec<u8> = vec![];
         U::try_from_physical_plan(stage.plan, codec.physical_extension_codec())
             .and_then(|proto| proto.try_encode(&mut plan))?;
-
-        let output_partitioning =
-            hash_partitioning_to_proto(stage.output_partitioning.as_ref())?;
 
         let task_infos: Vec<protobuf::TaskInfo> = stage
             .task_infos
@@ -1199,7 +1136,6 @@ impl FailedStage {
             stage_id: stage_id as u32,
             stage_attempt_num: stage.stage_attempt_num as u32,
             partitions: stage.partitions as u32,
-            output_partitioning,
             output_links: stage.output_links.into_iter().map(|l| l as u32).collect(),
             plan,
             task_infos,
@@ -1211,7 +1147,7 @@ impl FailedStage {
 
 impl Debug for FailedStage {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        let plan = DisplayableExecutionPlan::new(self.plan.as_ref()).indent();
+        let plan = DisplayableExecutionPlan::new(self.plan.as_ref()).indent(false);
 
         write!(
             f,
@@ -1226,6 +1162,16 @@ impl Debug for FailedStage {
             plan
         )
     }
+}
+
+/// Get the total number of partitions for a stage with plan.
+/// Only for [`ShuffleWriterExec`], the input partition count and the output partition count
+/// will be different. Here, we should use the input partition count.
+fn get_stage_partitions(plan: Arc<dyn ExecutionPlan>) -> usize {
+    plan.as_any()
+        .downcast_ref::<ShuffleWriterExec>()
+        .map(|shuffle_writer| shuffle_writer.input_partition_count())
+        .unwrap_or_else(|| plan.output_partitioning().partition_count())
 }
 
 /// This data structure collects the partition locations for an `ExecutionStage`.

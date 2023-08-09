@@ -15,12 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use datafusion::config::ConfigOptions;
 use datafusion::physical_plan::ExecutionPlan;
 
 use ballista_core::serde::protobuf::{
     scheduler_grpc_client::SchedulerGrpcClient, PollWorkParams, PollWorkResult,
     TaskDefinition, TaskStatus,
 };
+use datafusion::prelude::SessionConfig;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::cpu_bound_executor::DedicatedExecutor;
@@ -29,10 +31,8 @@ use crate::{as_task_status, TaskExecutionTimes};
 use ballista_core::error::BallistaError;
 use ballista_core::serde::scheduler::{ExecutorSpecification, PartitionId};
 use ballista_core::serde::BallistaCodec;
-use ballista_core::utils::collect_plan_metrics;
 use datafusion::execution::context::TaskContext;
 use datafusion_proto::logical_plan::AsLogicalPlan;
-use datafusion_proto::physical_plan::from_proto::parse_protobuf_hash_partitioning;
 use datafusion_proto::physical_plan::AsExecutionPlan;
 use futures::FutureExt;
 use log::{debug, error, info, warn};
@@ -173,9 +173,15 @@ async fn run_received_task<T: 'static + AsLogicalPlan, U: 'static + AsExecutionP
     for kv_pair in task.props {
         task_props.insert(kv_pair.key, kv_pair.value);
     }
+    let mut config = ConfigOptions::new();
+    for (k, v) in task_props {
+        config.set(&k, &v)?;
+    }
+    let session_config = SessionConfig::from(config);
 
     let mut task_scalar_functions = HashMap::new();
     let mut task_aggregate_functions = HashMap::new();
+    let mut task_window_functions = HashMap::new();
     // TODO combine the functions from Executor's functions and TaskDefintion's function resources
     for scalar_func in executor.scalar_functions.clone() {
         task_scalar_functions.insert(scalar_func.0.clone(), scalar_func.1);
@@ -183,14 +189,18 @@ async fn run_received_task<T: 'static + AsLogicalPlan, U: 'static + AsExecutionP
     for agg_func in executor.aggregate_functions.clone() {
         task_aggregate_functions.insert(agg_func.0, agg_func.1);
     }
-    let runtime = executor.runtime.clone();
+    for window_func in executor.window_functions.clone() {
+        task_window_functions.insert(window_func.0, window_func.1);
+    }
+    let runtime = executor.get_runtime(false);
     let session_id = task.session_id.clone();
     let task_context = Arc::new(TaskContext::new(
-        task_identity.clone(),
+        Some(task_identity.clone()),
         session_id,
-        task_props,
+        session_config,
         task_scalar_functions,
         task_aggregate_functions,
+        task_window_functions,
         runtime.clone(),
     ));
 
@@ -203,14 +213,12 @@ async fn run_received_task<T: 'static + AsLogicalPlan, U: 'static + AsExecutionP
             )
         })?;
 
-    let shuffle_output_partitioning = parse_protobuf_hash_partitioning(
-        task.output_partitioning.as_ref(),
-        task_context.as_ref(),
-        plan.schema().as_ref(),
+    let query_stage_exec = executor.execution_engine.create_query_stage_exec(
+        job_id.clone(),
+        stage_id as usize,
+        plan,
+        &executor.work_dir,
     )?;
-
-    let shuffle_writer_plan =
-        executor.new_shuffle_writer(job_id.clone(), stage_id as usize, plan)?;
     dedicated_executor.spawn(async move {
         use std::panic::AssertUnwindSafe;
         let part = PartitionId {
@@ -219,12 +227,11 @@ async fn run_received_task<T: 'static + AsLogicalPlan, U: 'static + AsExecutionP
             partition_id: partition_id as usize,
         };
 
-        let execution_result = match AssertUnwindSafe(executor.execute_shuffle_write(
+        let execution_result = match AssertUnwindSafe(executor.execute_query_stage(
             task_id as usize,
             part.clone(),
-            shuffle_writer_plan.clone(),
+            query_stage_exec.clone(),
             task_context,
-            shuffle_output_partitioning,
         ))
         .catch_unwind()
         .await
@@ -240,7 +247,7 @@ async fn run_received_task<T: 'static + AsLogicalPlan, U: 'static + AsExecutionP
         info!("Done with task {}", task_identity);
         debug!("Statistics: {:?}", execution_result);
 
-        let plan_metrics = collect_plan_metrics(shuffle_writer_plan.as_ref());
+        let plan_metrics = query_stage_exec.collect_plan_metrics();
         let operator_metrics = plan_metrics
             .into_iter()
             .map(|m| m.try_into())

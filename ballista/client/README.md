@@ -42,8 +42,8 @@ This crate is tested with the latest stable version of Rust. We do not currrentl
 ## Starting a cluster
 
 There are numerous ways to start a Ballista cluster, including support for Docker and
-Kubernetes. For full documentation, refer to the
-[DataFusion User Guide](https://arrow.apache.org/datafusion/user-guide/introduction.html)
+Kubernetes. For full documentation, refer to the deployment section of the
+[Ballista User Guide](https://arrow.apache.org/ballista/user-guide/deployment/)
 
 A simple way to start a local cluster for testing purposes is to use cargo to install
 the scheduler and executor crates.
@@ -84,8 +84,8 @@ To build a simple ballista example, add the following dependencies to your `Carg
 
 ```toml
 [dependencies]
-ballista = "0.10"
-datafusion = "19.0.0"
+ballista = "0.11"
+datafusion = "28.0.0"
 tokio = "1.0"
 ```
 
@@ -152,4 +152,4 @@ The output should look similar to the following table.
 +-----------------+--------------------------+--------------------------+--------------------------+--------------------------+
 ```
 
-More [examples](https://github.com/apache/arrow-datafusion/tree/master/ballista-examples) can be found in the arrow-datafusion repository.
+More [examples](https://github.com/apache/arrow-ballista/tree/main/examples) can be found in the arrow-ballista repository.

@@ -22,12 +22,12 @@ use ballista_core::execution_plans::{
     ShuffleReaderExec, ShuffleWriterExec, UnresolvedShuffleExec,
 };
 use datafusion::datasource::listing::PartitionedFile;
+use datafusion::datasource::physical_plan::{
+    AvroExec, CsvExec, FileScanConfig, NdJsonExec, ParquetExec,
+};
 use datafusion::physical_plan::aggregates::AggregateExec;
 use datafusion::physical_plan::coalesce_batches::CoalesceBatchesExec;
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
-use datafusion::physical_plan::file_format::{
-    AvroExec, CsvExec, FileScanConfig, NdJsonExec, ParquetExec,
-};
 use datafusion::physical_plan::filter::FilterExec;
 use datafusion::physical_plan::joins::CrossJoinExec;
 use datafusion::physical_plan::joins::HashJoinExec;
@@ -69,7 +69,7 @@ impl<'a> ExecutionGraphDot<'a> {
             writeln!(&mut dot, "}}")?;
             Ok(dot)
         } else {
-            Err(fmt::Error::default())
+            Err(fmt::Error)
         }
     }
 
@@ -318,7 +318,7 @@ filter_expr={}",
     } else if let Some(exec) = plan.as_any().downcast_ref::<ShuffleWriterExec>() {
         format!(
             "ShuffleWriter [{} partitions]",
-            exec.output_partitioning().partition_count()
+            exec.input_partition_count()
         )
     } else if plan.as_any().downcast_ref::<MemoryExec>().is_some() {
         "MemoryExec".to_string()
@@ -469,27 +469,25 @@ filter_expr="]
 	subgraph cluster4 {
 		label = "Stage 5 [Unresolved]";
 		stage_5_0 [shape=box, label="ShuffleWriter [48 partitions]"]
-		stage_5_0_0 [shape=box, label="Projection: a@0, b@1, a@2, b@3, a@4, b@5"]
-		stage_5_0_0_0 [shape=box, label="CoalesceBatches [batchSize=4096]"]
-		stage_5_0_0_0_0 [shape=box, label="HashJoin
+		stage_5_0_0 [shape=box, label="CoalesceBatches [batchSize=4096]"]
+		stage_5_0_0_0 [shape=box, label="HashJoin
 join_expr=b@3 = b@1
 filter_expr="]
-		stage_5_0_0_0_0_0 [shape=box, label="CoalesceBatches [batchSize=4096]"]
-		stage_5_0_0_0_0_0_0 [shape=box, label="UnresolvedShuffleExec [stage_id=3]"]
-		stage_5_0_0_0_0_0_0 -> stage_5_0_0_0_0_0
+		stage_5_0_0_0_0 [shape=box, label="CoalesceBatches [batchSize=4096]"]
+		stage_5_0_0_0_0_0 [shape=box, label="UnresolvedShuffleExec [stage_id=3]"]
 		stage_5_0_0_0_0_0 -> stage_5_0_0_0_0
-		stage_5_0_0_0_0_1 [shape=box, label="CoalesceBatches [batchSize=4096]"]
-		stage_5_0_0_0_0_1_0 [shape=box, label="UnresolvedShuffleExec [stage_id=4]"]
-		stage_5_0_0_0_0_1_0 -> stage_5_0_0_0_0_1
-		stage_5_0_0_0_0_1 -> stage_5_0_0_0_0
 		stage_5_0_0_0_0 -> stage_5_0_0_0
+		stage_5_0_0_0_1 [shape=box, label="CoalesceBatches [batchSize=4096]"]
+		stage_5_0_0_0_1_0 [shape=box, label="UnresolvedShuffleExec [stage_id=4]"]
+		stage_5_0_0_0_1_0 -> stage_5_0_0_0_1
+		stage_5_0_0_0_1 -> stage_5_0_0_0
 		stage_5_0_0_0 -> stage_5_0_0
 		stage_5_0_0 -> stage_5_0
 	}
 	stage_1_0 -> stage_3_0_0_0_0_0
 	stage_2_0 -> stage_3_0_0_0_1_0
-	stage_3_0 -> stage_5_0_0_0_0_0_0
-	stage_4_0 -> stage_5_0_0_0_0_1_0
+	stage_3_0 -> stage_5_0_0_0_0_0
+	stage_4_0 -> stage_5_0_0_0_1_0
 }
 "#;
         assert_eq!(expected, &dot);
@@ -552,36 +550,34 @@ filter_expr="]
 	subgraph cluster3 {
 		label = "Stage 4 [Unresolved]";
 		stage_4_0 [shape=box, label="ShuffleWriter [48 partitions]"]
-		stage_4_0_0 [shape=box, label="Projection: a@0, a@1, a@2"]
-		stage_4_0_0_0 [shape=box, label="CoalesceBatches [batchSize=4096]"]
-		stage_4_0_0_0_0 [shape=box, label="HashJoin
+		stage_4_0_0 [shape=box, label="CoalesceBatches [batchSize=4096]"]
+		stage_4_0_0_0 [shape=box, label="HashJoin
 join_expr=a@1 = a@0
 filter_expr="]
-		stage_4_0_0_0_0_0 [shape=box, label="CoalesceBatches [batchSize=4096]"]
-		stage_4_0_0_0_0_0_0 [shape=box, label="HashJoin
+		stage_4_0_0_0_0 [shape=box, label="CoalesceBatches [batchSize=4096]"]
+		stage_4_0_0_0_0_0 [shape=box, label="HashJoin
 join_expr=a@0 = a@0
 filter_expr="]
-		stage_4_0_0_0_0_0_0_0 [shape=box, label="CoalesceBatches [batchSize=4096]"]
-		stage_4_0_0_0_0_0_0_0_0 [shape=box, label="UnresolvedShuffleExec [stage_id=1]"]
-		stage_4_0_0_0_0_0_0_0_0 -> stage_4_0_0_0_0_0_0_0
+		stage_4_0_0_0_0_0_0 [shape=box, label="CoalesceBatches [batchSize=4096]"]
+		stage_4_0_0_0_0_0_0_0 [shape=box, label="UnresolvedShuffleExec [stage_id=1]"]
 		stage_4_0_0_0_0_0_0_0 -> stage_4_0_0_0_0_0_0
-		stage_4_0_0_0_0_0_0_1 [shape=box, label="CoalesceBatches [batchSize=4096]"]
-		stage_4_0_0_0_0_0_0_1_0 [shape=box, label="UnresolvedShuffleExec [stage_id=2]"]
-		stage_4_0_0_0_0_0_0_1_0 -> stage_4_0_0_0_0_0_0_1
-		stage_4_0_0_0_0_0_0_1 -> stage_4_0_0_0_0_0_0
 		stage_4_0_0_0_0_0_0 -> stage_4_0_0_0_0_0
+		stage_4_0_0_0_0_0_1 [shape=box, label="CoalesceBatches [batchSize=4096]"]
+		stage_4_0_0_0_0_0_1_0 [shape=box, label="UnresolvedShuffleExec [stage_id=2]"]
+		stage_4_0_0_0_0_0_1_0 -> stage_4_0_0_0_0_0_1
+		stage_4_0_0_0_0_0_1 -> stage_4_0_0_0_0_0
 		stage_4_0_0_0_0_0 -> stage_4_0_0_0_0
-		stage_4_0_0_0_0_1 [shape=box, label="CoalesceBatches [batchSize=4096]"]
-		stage_4_0_0_0_0_1_0 [shape=box, label="UnresolvedShuffleExec [stage_id=3]"]
-		stage_4_0_0_0_0_1_0 -> stage_4_0_0_0_0_1
-		stage_4_0_0_0_0_1 -> stage_4_0_0_0_0
 		stage_4_0_0_0_0 -> stage_4_0_0_0
+		stage_4_0_0_0_1 [shape=box, label="CoalesceBatches [batchSize=4096]"]
+		stage_4_0_0_0_1_0 [shape=box, label="UnresolvedShuffleExec [stage_id=3]"]
+		stage_4_0_0_0_1_0 -> stage_4_0_0_0_1
+		stage_4_0_0_0_1 -> stage_4_0_0_0
 		stage_4_0_0_0 -> stage_4_0_0
 		stage_4_0_0 -> stage_4_0
 	}
-	stage_1_0 -> stage_4_0_0_0_0_0_0_0_0
-	stage_2_0 -> stage_4_0_0_0_0_0_0_1_0
-	stage_3_0 -> stage_4_0_0_0_0_1_0
+	stage_1_0 -> stage_4_0_0_0_0_0_0_0
+	stage_2_0 -> stage_4_0_0_0_0_0_1_0
+	stage_3_0 -> stage_4_0_0_0_1_0
 }
 "#;
         assert_eq!(expected, &dot);
@@ -596,30 +592,28 @@ filter_expr="]
 
         let expected = r#"digraph G {
 		stage_4_0 [shape=box, label="ShuffleWriter [48 partitions]"]
-		stage_4_0_0 [shape=box, label="Projection: a@0, a@1, a@2"]
-		stage_4_0_0_0 [shape=box, label="CoalesceBatches [batchSize=4096]"]
-		stage_4_0_0_0_0 [shape=box, label="HashJoin
+		stage_4_0_0 [shape=box, label="CoalesceBatches [batchSize=4096]"]
+		stage_4_0_0_0 [shape=box, label="HashJoin
 join_expr=a@1 = a@0
 filter_expr="]
-		stage_4_0_0_0_0_0 [shape=box, label="CoalesceBatches [batchSize=4096]"]
-		stage_4_0_0_0_0_0_0 [shape=box, label="HashJoin
+		stage_4_0_0_0_0 [shape=box, label="CoalesceBatches [batchSize=4096]"]
+		stage_4_0_0_0_0_0 [shape=box, label="HashJoin
 join_expr=a@0 = a@0
 filter_expr="]
-		stage_4_0_0_0_0_0_0_0 [shape=box, label="CoalesceBatches [batchSize=4096]"]
-		stage_4_0_0_0_0_0_0_0_0 [shape=box, label="UnresolvedShuffleExec [stage_id=1]"]
-		stage_4_0_0_0_0_0_0_0_0 -> stage_4_0_0_0_0_0_0_0
+		stage_4_0_0_0_0_0_0 [shape=box, label="CoalesceBatches [batchSize=4096]"]
+		stage_4_0_0_0_0_0_0_0 [shape=box, label="UnresolvedShuffleExec [stage_id=1]"]
 		stage_4_0_0_0_0_0_0_0 -> stage_4_0_0_0_0_0_0
-		stage_4_0_0_0_0_0_0_1 [shape=box, label="CoalesceBatches [batchSize=4096]"]
-		stage_4_0_0_0_0_0_0_1_0 [shape=box, label="UnresolvedShuffleExec [stage_id=2]"]
-		stage_4_0_0_0_0_0_0_1_0 -> stage_4_0_0_0_0_0_0_1
-		stage_4_0_0_0_0_0_0_1 -> stage_4_0_0_0_0_0_0
 		stage_4_0_0_0_0_0_0 -> stage_4_0_0_0_0_0
+		stage_4_0_0_0_0_0_1 [shape=box, label="CoalesceBatches [batchSize=4096]"]
+		stage_4_0_0_0_0_0_1_0 [shape=box, label="UnresolvedShuffleExec [stage_id=2]"]
+		stage_4_0_0_0_0_0_1_0 -> stage_4_0_0_0_0_0_1
+		stage_4_0_0_0_0_0_1 -> stage_4_0_0_0_0_0
 		stage_4_0_0_0_0_0 -> stage_4_0_0_0_0
-		stage_4_0_0_0_0_1 [shape=box, label="CoalesceBatches [batchSize=4096]"]
-		stage_4_0_0_0_0_1_0 [shape=box, label="UnresolvedShuffleExec [stage_id=3]"]
-		stage_4_0_0_0_0_1_0 -> stage_4_0_0_0_0_1
-		stage_4_0_0_0_0_1 -> stage_4_0_0_0_0
 		stage_4_0_0_0_0 -> stage_4_0_0_0
+		stage_4_0_0_0_1 [shape=box, label="CoalesceBatches [batchSize=4096]"]
+		stage_4_0_0_0_1_0 [shape=box, label="UnresolvedShuffleExec [stage_id=3]"]
+		stage_4_0_0_0_1_0 -> stage_4_0_0_0_1
+		stage_4_0_0_0_1 -> stage_4_0_0_0
 		stage_4_0_0_0 -> stage_4_0_0
 		stage_4_0_0 -> stage_4_0
 }
@@ -633,7 +627,7 @@ filter_expr="]
             .with_target_partitions(48)
             .with_batch_size(4096);
         config
-            .config_options_mut()
+            .options_mut()
             .optimizer
             .enable_round_robin_repartition = false;
         let ctx = SessionContext::with_config(config);
@@ -660,7 +654,7 @@ filter_expr="]
             .with_target_partitions(48)
             .with_batch_size(4096);
         config
-            .config_options_mut()
+            .options_mut()
             .optimizer
             .enable_round_robin_repartition = false;
         let ctx = SessionContext::with_config(config);

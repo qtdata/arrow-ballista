@@ -23,9 +23,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use datafusion::physical_plan::display::DisplayableExecutionPlan;
-use datafusion::physical_plan::{
-    accept, ExecutionPlan, ExecutionPlanVisitor, Partitioning,
-};
+use datafusion::physical_plan::{accept, ExecutionPlan, ExecutionPlanVisitor};
 use datafusion::prelude::SessionContext;
 use datafusion_proto::logical_plan::AsLogicalPlan;
 use log::{error, info, warn};
@@ -50,6 +48,7 @@ use crate::display::print_stage_metrics;
 use crate::planner::DistributedPlanner;
 use crate::scheduler_server::event::QueryStageSchedulerEvent;
 use crate::scheduler_server::timestamp_millis;
+use crate::state::execution_graph::execution_stage::RunningStage;
 pub(crate) use crate::state::execution_graph::execution_stage::{
     ExecutionStage, FailedStage, ResolvedStage, StageOutput, SuccessfulStage, TaskInfo,
     UnresolvedStage,
@@ -132,7 +131,7 @@ pub struct ExecutionGraph {
     failed_stage_attempts: HashMap<usize, HashSet<usize>>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct RunningTaskInfo {
     pub task_id: usize,
     pub job_id: String,
@@ -198,8 +197,8 @@ impl ExecutionGraph {
         self.session_id.as_str()
     }
 
-    pub fn status(&self) -> JobStatus {
-        self.status.clone()
+    pub fn status(&self) -> &JobStatus {
+        &self.status
     }
 
     pub fn start_time(&self) -> u64 {
@@ -311,161 +310,152 @@ impl ExecutionGraph {
                 if let ExecutionStage::Running(running_stage) = stage {
                     let mut locations = vec![];
                     for task_status in stage_task_statuses.into_iter() {
-                        {
-                            let task_stage_attempt_num =
-                                task_status.stage_attempt_num as usize;
-                            if task_stage_attempt_num < running_stage.stage_attempt_num {
-                                warn!("Ignore TaskStatus update with TID {} as it's from Stage {}.{} and there is a more recent stage attempt {}.{} running",
+                        let task_stage_attempt_num =
+                            task_status.stage_attempt_num as usize;
+                        if task_stage_attempt_num < running_stage.stage_attempt_num {
+                            warn!("Ignore TaskStatus update with TID {} as it's from Stage {}.{} and there is a more recent stage attempt {}.{} running",
                                     task_status.task_id, stage_id, task_stage_attempt_num, stage_id, running_stage.stage_attempt_num);
-                                continue;
-                            }
-                            let partition_id = task_status.clone().partition_id as usize;
-                            let task_identity = format!(
-                                "TID {} {}/{}.{}/{}",
-                                task_status.task_id,
-                                job_id,
-                                stage_id,
-                                task_stage_attempt_num,
-                                partition_id
-                            );
-                            let operator_metrics = task_status.metrics.clone();
+                            continue;
+                        }
+                        let partition_id = task_status.clone().partition_id as usize;
+                        let task_identity = format!(
+                            "TID {} {}/{}.{}/{}",
+                            task_status.task_id,
+                            job_id,
+                            stage_id,
+                            task_stage_attempt_num,
+                            partition_id
+                        );
+                        let operator_metrics = task_status.metrics.clone();
 
-                            if !running_stage
-                                .update_task_info(partition_id, task_status.clone())
-                            {
-                                continue;
-                            }
+                        if !running_stage
+                            .update_task_info(partition_id, task_status.clone())
+                        {
+                            continue;
+                        }
 
-                            if let Some(task_status::Status::Failed(failed_task)) =
-                                task_status.status
-                            {
-                                let failed_reason = failed_task.failed_reason;
+                        if let Some(task_status::Status::Failed(failed_task)) =
+                            task_status.status
+                        {
+                            let failed_reason = failed_task.failed_reason;
 
-                                match failed_reason {
-                                    Some(FailedReason::FetchPartitionError(
-                                        fetch_partiton_error,
-                                    )) => {
-                                        let failed_attempts = failed_stage_attempts
-                                            .entry(stage_id)
-                                            .or_insert_with(HashSet::new);
-                                        failed_attempts.insert(task_stage_attempt_num);
-                                        if failed_attempts.len() < max_stage_failures {
-                                            let map_stage_id = fetch_partiton_error
-                                                .map_stage_id
-                                                as usize;
-                                            let map_partition_id = fetch_partiton_error
-                                                .map_partition_id
-                                                as usize;
-                                            let executor_id =
-                                                fetch_partiton_error.executor_id;
+                            match failed_reason {
+                                Some(FailedReason::FetchPartitionError(
+                                    fetch_partiton_error,
+                                )) => {
+                                    let failed_attempts = failed_stage_attempts
+                                        .entry(stage_id)
+                                        .or_insert_with(HashSet::new);
+                                    failed_attempts.insert(task_stage_attempt_num);
+                                    if failed_attempts.len() < max_stage_failures {
+                                        let map_stage_id =
+                                            fetch_partiton_error.map_stage_id as usize;
+                                        let map_partition_id = fetch_partiton_error
+                                            .map_partition_id
+                                            as usize;
+                                        let executor_id =
+                                            fetch_partiton_error.executor_id;
 
-                                            if !failed_stages.is_empty() {
-                                                let error_msg = format!(
-                                                        "Stages was marked failed, ignore FetchPartitionError from task {task_identity}");
-                                                warn!("{}", error_msg);
-                                            } else {
-                                                // There are different removal strategies here.
-                                                // We can choose just remove the map_partition_id in the FetchPartitionError, when resubmit the input stage, there are less tasks
-                                                // need to rerun, but this might miss many more bad input partitions, lead to more stage level retries in following.
-                                                // Here we choose remove all the bad input partitions which match the same executor id in this single input stage.
-                                                // There are other more aggressive approaches, like considering the executor is lost and check all the running stages in this graph.
-                                                // Or count the fetch failure number on executor and mark the executor lost globally.
-                                                let removed_map_partitions =
-                                                    running_stage
-                                                        .remove_input_partitions(
-                                                            map_stage_id,
-                                                            map_partition_id,
-                                                            &executor_id,
-                                                        )?;
-
-                                                let failure_reasons =
-                                                    rollback_running_stages
-                                                        .entry(stage_id)
-                                                        .or_insert_with(HashSet::new);
-                                                failure_reasons.insert(executor_id);
-
-                                                let missing_inputs =
-                                                    resubmit_successful_stages
-                                                        .entry(map_stage_id)
-                                                        .or_insert_with(HashSet::new);
-                                                missing_inputs
-                                                    .extend(removed_map_partitions);
-                                                warn!("Need to resubmit the current running Stage {} and its map Stage {} due to FetchPartitionError from task {}",
-                                                    stage_id, map_stage_id, task_identity)
-                                            }
-                                        } else {
+                                        if !failed_stages.is_empty() {
                                             let error_msg = format!(
-                                                "Stage {} has failed {} times, \
-                                            most recent failure reason: {:?}",
-                                                stage_id,
-                                                max_stage_failures,
-                                                failed_task.error
-                                            );
-                                            error!("{}", error_msg);
-                                            failed_stages.insert(stage_id, error_msg);
+                                                "Stages was marked failed, ignore FetchPartitionError from task {task_identity}");
+                                            warn!("{}", error_msg);
+                                        } else {
+                                            // There are different removal strategies here.
+                                            // We can choose just remove the map_partition_id in the FetchPartitionError, when resubmit the input stage, there are less tasks
+                                            // need to rerun, but this might miss many more bad input partitions, lead to more stage level retries in following.
+                                            // Here we choose remove all the bad input partitions which match the same executor id in this single input stage.
+                                            // There are other more aggressive approaches, like considering the executor is lost and check all the running stages in this graph.
+                                            // Or count the fetch failure number on executor and mark the executor lost globally.
+                                            let removed_map_partitions = running_stage
+                                                .remove_input_partitions(
+                                                    map_stage_id,
+                                                    map_partition_id,
+                                                    &executor_id,
+                                                )?;
+
+                                            let failure_reasons = rollback_running_stages
+                                                .entry(stage_id)
+                                                .or_insert_with(HashSet::new);
+                                            failure_reasons.insert(executor_id);
+
+                                            let missing_inputs =
+                                                resubmit_successful_stages
+                                                    .entry(map_stage_id)
+                                                    .or_insert_with(HashSet::new);
+                                            missing_inputs.extend(removed_map_partitions);
+                                            warn!("Need to resubmit the current running Stage {} and its map Stage {} due to FetchPartitionError from task {}",
+                                                    stage_id, map_stage_id, task_identity)
                                         }
-                                    }
-                                    Some(FailedReason::ExecutionError(_)) => {
-                                        failed_stages.insert(stage_id, failed_task.error);
-                                    }
-                                    Some(_) => {
-                                        if failed_task.retryable
-                                            && failed_task.count_to_failures
-                                        {
-                                            if running_stage
-                                                .task_failure_number(partition_id)
-                                                < max_task_failures
-                                            {
-                                                // TODO add new struct to track all the failed task infos
-                                                // The failure TaskInfo is ignored and set to None here
-                                                running_stage
-                                                    .reset_task_info(partition_id);
-                                            } else {
-                                                let error_msg = format!(
-                        "Task {} in Stage {} failed {} times, fail the stage, most recent failure reason: {:?}",
-                        partition_id, stage_id, max_task_failures, failed_task.error
-                    );
-                                                error!("{}", error_msg);
-                                                failed_stages.insert(stage_id, error_msg);
-                                            }
-                                        } else if failed_task.retryable {
-                                            // TODO add new struct to track all the failed task infos
-                                            // The failure TaskInfo is ignored and set to None here
-                                            running_stage.reset_task_info(partition_id);
-                                        }
-                                    }
-                                    None => {
+                                    } else {
                                         let error_msg = format!(
-                                            "Task {partition_id} in Stage {stage_id} failed with unknown failure reasons, fail the stage");
+                                            "Stage {} has failed {} times, \
+                                            most recent failure reason: {:?}",
+                                            stage_id,
+                                            max_stage_failures,
+                                            failed_task.error
+                                        );
                                         error!("{}", error_msg);
                                         failed_stages.insert(stage_id, error_msg);
                                     }
                                 }
-                            } else if let Some(task_status::Status::Successful(
-                                successful_task,
-                            )) = task_status.status
-                            {
-                                // update task metrics for successfu task
-                                running_stage.update_task_metrics(
-                                    partition_id,
-                                    operator_metrics,
-                                )?;
-
-                                locations.append(&mut partition_to_location(
-                                    &job_id,
-                                    partition_id,
-                                    stage_id,
-                                    executor,
-                                    successful_task.partitions,
-                                ));
-                            } else {
-                                warn!(
-                                    "The task {}'s status is invalid for updating",
-                                    task_identity
-                                );
+                                Some(FailedReason::ExecutionError(_)) => {
+                                    failed_stages.insert(stage_id, failed_task.error);
+                                }
+                                Some(_) => {
+                                    if failed_task.retryable
+                                        && failed_task.count_to_failures
+                                    {
+                                        if running_stage.task_failure_number(partition_id)
+                                            < max_task_failures
+                                        {
+                                            // TODO add new struct to track all the failed task infos
+                                            // The failure TaskInfo is ignored and set to None here
+                                            running_stage.reset_task_info(partition_id);
+                                        } else {
+                                            let error_msg = format!(
+                                                "Task {} in Stage {} failed {} times, fail the stage, most recent failure reason: {:?}",
+                                                partition_id, stage_id, max_task_failures, failed_task.error
+                                            );
+                                            error!("{}", error_msg);
+                                            failed_stages.insert(stage_id, error_msg);
+                                        }
+                                    } else if failed_task.retryable {
+                                        // TODO add new struct to track all the failed task infos
+                                        // The failure TaskInfo is ignored and set to None here
+                                        running_stage.reset_task_info(partition_id);
+                                    }
+                                }
+                                None => {
+                                    let error_msg = format!(
+                                        "Task {partition_id} in Stage {stage_id} failed with unknown failure reasons, fail the stage");
+                                    error!("{}", error_msg);
+                                    failed_stages.insert(stage_id, error_msg);
+                                }
                             }
+                        } else if let Some(task_status::Status::Successful(
+                            successful_task,
+                        )) = task_status.status
+                        {
+                            // update task metrics for successfu task
+                            running_stage
+                                .update_task_metrics(partition_id, operator_metrics)?;
+
+                            locations.append(&mut partition_to_location(
+                                &job_id,
+                                partition_id,
+                                stage_id,
+                                executor,
+                                successful_task.partitions,
+                            ));
+                        } else {
+                            warn!(
+                                "The task {}'s status is invalid for updating",
+                                task_identity
+                            );
                         }
                     }
+
                     let is_final_successful = running_stage.is_successful()
                         && !reset_running_stages.contains_key(&stage_id);
                     if is_final_successful {
@@ -899,9 +889,9 @@ impl ExecutionGraph {
                 let task_info = TaskInfo {
                     task_id,
                     scheduled_time: SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap()
-                    .as_millis(),
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap()
+                        .as_millis(),
                     // Those times will be updated when the task finish
                     launch_time: 0,
                     start_exec_time: 0,
@@ -921,8 +911,8 @@ impl ExecutionGraph {
                     stage_attempt_num: stage.stage_attempt_num,
                     task_id,
                     task_attempt,
+                    data_cache: false,
                     plan: stage.plan.clone(),
-                    output_partitioning: stage.output_partitioning.clone(),
                 })
             } else {
                 Err(BallistaError::General(format!("Stage {stage_id} is not a running stage")))
@@ -940,6 +930,64 @@ impl ExecutionGraph {
         }
 
         Ok(next_task)
+    }
+
+    pub(crate) fn fetch_running_stage(
+        &mut self,
+        black_list: &[usize],
+    ) -> Option<(&mut RunningStage, &mut usize)> {
+        if matches!(
+            self.status,
+            JobStatus {
+                status: Some(job_status::Status::Failed(_)),
+                ..
+            }
+        ) {
+            warn!("Call fetch_runnable_stage on failed Job");
+            return None;
+        }
+
+        let running_stage_id = self.get_running_stage_id(black_list);
+        if let Some(running_stage_id) = running_stage_id {
+            if let Some(ExecutionStage::Running(running_stage)) =
+                self.stages.get_mut(&running_stage_id)
+            {
+                Some((running_stage, &mut self.task_id_gen))
+            } else {
+                warn!("Fail to find running stage with id {running_stage_id}");
+                None
+            }
+        } else {
+            None
+        }
+    }
+
+    fn get_running_stage_id(&mut self, black_list: &[usize]) -> Option<usize> {
+        let mut running_stage_id = self.stages.iter().find_map(|(stage_id, stage)| {
+            if black_list.contains(stage_id) {
+                None
+            } else if let ExecutionStage::Running(stage) = stage {
+                if stage.available_tasks() > 0 {
+                    Some(*stage_id)
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        });
+
+        // If no available tasks found in the running stage,
+        // try to find a resolved stage and convert it to the running stage
+        if running_stage_id.is_none() {
+            if self.revive() {
+                running_stage_id = self.get_running_stage_id(black_list);
+            } else {
+                running_stage_id = None;
+            }
+        }
+
+        running_stage_id
     }
 
     pub fn update_status(&mut self, status: JobStatus) {
@@ -1040,15 +1088,14 @@ impl ExecutionGraph {
                             warn!(
                             "Roll back resolved job/stage {}/{} and change ShuffleReaderExec back to UnresolvedShuffleExec",
                             job_id, stage_id);
-
-                        },
+                        }
                         ExecutionStage::Running(_) => {
                             rollback_running_stages.insert(*stage_id);
                             warn!(
                             "Roll back running job/stage {}/{} and change ShuffleReaderExec back to UnresolvedShuffleExec",
                             job_id, stage_id);
-                        },
-                        _ => {},
+                        }
+                        _ => {}
                     }
                 }
             });
@@ -1443,6 +1490,22 @@ impl Debug for ExecutionGraph {
     }
 }
 
+pub(crate) fn create_task_info(executor_id: String, task_id: usize) -> TaskInfo {
+    TaskInfo {
+        task_id,
+        scheduled_time: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis(),
+        // Those times will be updated when the task finish
+        launch_time: 0,
+        start_exec_time: 0,
+        end_exec_time: 0,
+        finish_time: 0,
+        task_status: task_status::Status::Running(RunningTask { executor_id }),
+    }
+}
+
 /// Utility for building a set of `ExecutionStage`s from
 /// a list of `ShuffleWriterExec`.
 ///
@@ -1478,7 +1541,6 @@ impl ExecutionStageBuilder {
 
         // Now, create the execution stages
         for stage in stages {
-            let partitioning = stage.shuffle_output_partitioning().cloned();
             let stage_id = stage.stage_id();
             let output_links = self.output_links.remove(&stage_id).unwrap_or_default();
 
@@ -1492,7 +1554,6 @@ impl ExecutionStageBuilder {
                     stage_id,
                     0,
                     stage,
-                    partitioning,
                     output_links,
                     HashMap::new(),
                     HashSet::new(),
@@ -1501,7 +1562,6 @@ impl ExecutionStageBuilder {
                 ExecutionStage::UnResolved(UnresolvedStage::new(
                     stage_id,
                     stage,
-                    partitioning,
                     output_links,
                     child_stages,
                 ))
@@ -1558,16 +1618,16 @@ pub struct TaskDescription {
     pub stage_attempt_num: usize,
     pub task_id: usize,
     pub task_attempt: usize,
+    pub data_cache: bool,
     pub plan: Arc<dyn ExecutionPlan>,
-    pub output_partitioning: Option<Partitioning>,
 }
 
 impl Debug for TaskDescription {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        let plan = DisplayableExecutionPlan::new(self.plan.as_ref()).indent();
+        let plan = DisplayableExecutionPlan::new(self.plan.as_ref()).indent(false);
         write!(
             f,
-            "TaskDescription[session_id: {},job: {}, stage: {}.{}, partition: {} task_id {}, task attempt {}]\n{}",
+            "TaskDescription[session_id: {},job: {}, stage: {}.{}, partition: {} task_id {}, task attempt {}, data cache {}]\n{}",
             self.session_id,
             self.partition.job_id,
             self.partition.stage_id,
@@ -1575,8 +1635,23 @@ impl Debug for TaskDescription {
             self.partition.partition_id,
             self.task_id,
             self.task_attempt,
+            self.data_cache,
             plan
         )
+    }
+}
+
+impl TaskDescription {
+    pub fn get_output_partition_number(&self) -> usize {
+        let shuffle_writer = self
+            .plan
+            .as_any()
+            .downcast_ref::<ShuffleWriterExec>()
+            .unwrap();
+        shuffle_writer
+            .shuffle_output_partitioning()
+            .map(|partitioning| partitioning.partition_count())
+            .unwrap_or_else(|| 1)
     }
 }
 

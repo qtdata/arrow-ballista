@@ -109,7 +109,8 @@ impl DistributedPlanner {
             let unresolved_shuffle = create_unresolved_shuffle(&shuffle_writer);
             stages.push(shuffle_writer);
             Ok((
-                with_new_children_if_necessary(execution_plan, vec![unresolved_shuffle])?,
+                with_new_children_if_necessary(execution_plan, vec![unresolved_shuffle])?
+                    .into(),
                 stages,
             ))
         } else if let Some(_sort_preserving_merge) = execution_plan
@@ -125,7 +126,8 @@ impl DistributedPlanner {
             let unresolved_shuffle = create_unresolved_shuffle(&shuffle_writer);
             stages.push(shuffle_writer);
             Ok((
-                with_new_children_if_necessary(execution_plan, vec![unresolved_shuffle])?,
+                with_new_children_if_necessary(execution_plan, vec![unresolved_shuffle])?
+                    .into(),
                 stages,
             ))
         } else if let Some(repart) =
@@ -156,7 +158,7 @@ impl DistributedPlanner {
             )))
         } else {
             Ok((
-                with_new_children_if_necessary(execution_plan, children)?,
+                with_new_children_if_necessary(execution_plan, children)?.into(),
                 stages,
             ))
         }
@@ -176,10 +178,6 @@ fn create_unresolved_shuffle(
         shuffle_writer.stage_id(),
         shuffle_writer.schema(),
         shuffle_writer.output_partitioning().partition_count(),
-        shuffle_writer
-            .shuffle_output_partitioning()
-            .map(|p| p.partition_count())
-            .unwrap_or_else(|| shuffle_writer.output_partitioning().partition_count()),
     ))
 }
 
@@ -244,6 +242,7 @@ pub fn remove_unresolved_shuffles(
                     .join("\n")
             );
             new_children.push(Arc::new(ShuffleReaderExec::try_new(
+                unresolved_shuffle.stage_id,
                 relevant_locations,
                 unresolved_shuffle.schema().clone(),
             )?))
@@ -251,7 +250,7 @@ pub fn remove_unresolved_shuffles(
             new_children.push(remove_unresolved_shuffles(child, partition_locations)?);
         }
     }
-    Ok(with_new_children_if_necessary(stage, new_children)?)
+    Ok(with_new_children_if_necessary(stage, new_children)?.into())
 }
 
 /// Rollback the ShuffleReaderExec to UnresolvedShuffleExec.
@@ -263,15 +262,13 @@ pub fn rollback_resolved_shuffles(
     let mut new_children: Vec<Arc<dyn ExecutionPlan>> = vec![];
     for child in stage.children() {
         if let Some(shuffle_reader) = child.as_any().downcast_ref::<ShuffleReaderExec>() {
-            let partition_locations = &shuffle_reader.partition;
-            let output_partition_count = partition_locations.len();
-            let input_partition_count = partition_locations[0].len();
-            let stage_id = partition_locations[0][0].partition_id.stage_id;
+            let output_partition_count =
+                shuffle_reader.output_partitioning().partition_count();
+            let stage_id = shuffle_reader.stage_id;
 
             let unresolved_shuffle = Arc::new(UnresolvedShuffleExec::new(
                 stage_id,
                 shuffle_reader.schema(),
-                input_partition_count,
                 output_partition_count,
             ));
             new_children.push(unresolved_shuffle);
@@ -279,7 +276,7 @@ pub fn rollback_resolved_shuffles(
             new_children.push(rollback_resolved_shuffles(child)?);
         }
     }
-    Ok(with_new_children_if_necessary(stage, new_children)?)
+    Ok(with_new_children_if_necessary(stage, new_children)?.into())
 }
 
 fn create_shuffle_writer(
@@ -348,7 +345,7 @@ mod test {
         let job_uuid = Uuid::new_v4();
         let stages = planner.plan_query_stages(&job_uuid.to_string(), plan)?;
         for stage in &stages {
-            println!("{}", displayable(stage.as_ref()).indent());
+            println!("{}", displayable(stage.as_ref()).indent(false));
         }
 
         /* Expected result:
@@ -390,7 +387,6 @@ mod test {
         let unresolved_shuffle =
             downcast_exec!(unresolved_shuffle, UnresolvedShuffleExec);
         assert_eq!(unresolved_shuffle.stage_id, 1);
-        assert_eq!(unresolved_shuffle.input_partition_count, 2);
         assert_eq!(unresolved_shuffle.output_partition_count, 2);
 
         // verify stage 2
@@ -400,7 +396,6 @@ mod test {
         let unresolved_shuffle =
             downcast_exec!(unresolved_shuffle, UnresolvedShuffleExec);
         assert_eq!(unresolved_shuffle.stage_id, 2);
-        assert_eq!(unresolved_shuffle.input_partition_count, 2);
         assert_eq!(unresolved_shuffle.output_partition_count, 2);
 
         Ok(())
@@ -456,38 +451,40 @@ order by
         let job_uuid = Uuid::new_v4();
         let stages = planner.plan_query_stages(&job_uuid.to_string(), plan)?;
         for stage in &stages {
-            println!("{}", displayable(stage.as_ref()).indent());
+            println!("{}", displayable(stage.as_ref()).indent(false));
         }
 
         /* Expected result:
 
         ShuffleWriterExec: Some(Hash([Column { name: "l_orderkey", index: 0 }], 2))
-          CoalesceBatchesExec: target_batch_size=4096
-            FilterExec: l_shipmode@4 IN ([Literal { value: Utf8("MAIL") }, Literal { value: Utf8("SHIP") }]) AND l_commitdate@2 < l_receiptdate@3 AND l_shipdate@1 < l_commitdate@2 AND l_receiptdate@3 >= 8766 AND l_receiptdate@3 < 9131
-              CsvExec: source=Path(testdata/lineitem: [testdata/lineitem/partition0.tbl,testdata/lineitem/partition1.tbl]), has_header=false
+          ProjectionExec: expr=[l_orderkey@0 as l_orderkey, l_shipmode@4 as l_shipmode]
+            CoalesceBatchesExec: target_batch_size=8192
+              FilterExec: (l_shipmode@4 = SHIP OR l_shipmode@4 = MAIL) AND l_commitdate@2 < l_receiptdate@3 AND l_shipdate@1 < l_commitdate@2 AND l_receiptdate@3 >= 8766 AND l_receiptdate@3 < 9131
+                CsvExec: files={2 groups: [[testdata/lineitem/partition0.tbl], [testdata/lineitem/partition1.tbl]]}, has_header=false, limit=None, projection=[l_orderkey, l_shipdate, l_commitdate, l_receiptdate, l_shipmode]
 
         ShuffleWriterExec: Some(Hash([Column { name: "o_orderkey", index: 0 }], 2))
-          CsvExec: source=Path(testdata/orders: [testdata/orders/orders.tbl]), has_header=false
+          CsvExec: files={1 group: [[testdata/orders/orders.tbl]]}, has_header=false, limit=None, projection=[o_orderkey, o_orderpriority]
 
         ShuffleWriterExec: Some(Hash([Column { name: "l_shipmode", index: 0 }], 2))
-          AggregateExec: mode=Partial, gby=[l_shipmode@4 as l_shipmode], aggr=[SUM(CASE WHEN #orders.o_orderpriority Eq Utf8("1-URGENT") Or #orders.o_orderpriority Eq Utf8("2-HIGH") THEN Int64(1) ELSE Int64(0) END), SUM(CASE WHEN #orders.o_orderpriority NotEq Utf8("1-URGENT") And #orders.o_orderpriority NotEq Utf8("2-HIGH") THEN Int64(1) ELSE Int64(0) END)]
-            CoalesceBatchesExec: target_batch_size=4096
-              HashJoinExec: mode=Partitioned, join_type=Inner, on=[(Column { name: "l_orderkey", index: 0 }, Column { name: "o_orderkey", index: 0 })]
-                CoalesceBatchesExec: target_batch_size=4096
-                  UnresolvedShuffleExec
-                CoalesceBatchesExec: target_batch_size=4096
+          AggregateExec: mode=Partial, gby=[l_shipmode@0 as l_shipmode], aggr=[SUM(CASE WHEN orders.o_orderpriority = Utf8("1-URGENT") OR orders.o_orderpriority = Utf8("2-HIGH") THEN Int64(1) ELSE Int64(0) END), SUM(CASE WHEN orders.o_orderpriority != Utf8("1-URGENT") AND orders.o_orderpriority != Utf8("2-HIGH") THEN Int64(1) ELSE Int64(0) END)]
+            ProjectionExec: expr=[l_shipmode@1 as l_shipmode, o_orderpriority@3 as o_orderpriority]
+              CoalesceBatchesExec: target_batch_size=8192
+                HashJoinExec: mode=Partitioned, join_type=Inner, on=[(Column { name: "l_orderkey", index: 0 }, Column { name: "o_orderkey", index: 0 })]
+                  CoalesceBatchesExec: target_batch_size=8192
+                    UnresolvedShuffleExec
+                  CoalesceBatchesExec: target_batch_size=8192
+                    UnresolvedShuffleExec
+
+        ShuffleWriterExec: None
+          SortExec: expr=[l_shipmode@0 ASC NULLS LAST]
+            ProjectionExec: expr=[l_shipmode@0 as l_shipmode, SUM(CASE WHEN orders.o_orderpriority = Utf8("1-URGENT") OR orders.o_orderpriority = Utf8("2-HIGH") THEN Int64(1) ELSE Int64(0) END)@1 as high_line_count, SUM(CASE WHEN orders.o_orderpriority != Utf8("1-URGENT") AND orders.o_orderpriority != Utf8("2-HIGH") THEN Int64(1) ELSE Int64(0) END)@2 as low_line_count]
+              AggregateExec: mode=FinalPartitioned, gby=[l_shipmode@0 as l_shipmode], aggr=[SUM(CASE WHEN orders.o_orderpriority = Utf8("1-URGENT") OR orders.o_orderpriority = Utf8("2-HIGH") THEN Int64(1) ELSE Int64(0) END), SUM(CASE WHEN orders.o_orderpriority != Utf8("1-URGENT") AND orders.o_orderpriority != Utf8("2-HIGH") THEN Int64(1) ELSE Int64(0) END)]
+                CoalesceBatchesExec: target_batch_size=8192
                   UnresolvedShuffleExec
 
         ShuffleWriterExec: None
-          ProjectionExec: expr=[l_shipmode@0 as l_shipmode, SUM(CASE WHEN #orders.o_orderpriority Eq Utf8("1-URGENT") Or #orders.o_orderpriority Eq Utf8("2-HIGH") THEN Int64(1) ELSE Int64(0) END)@1 as high_line_count, SUM(CASE WHEN #orders.o_orderpriority NotEq Utf8("1-URGENT") And #orders.o_orderpriority NotEq Utf8("2-HIGH") THEN Int64(1) ELSE Int64(0) END)@2 as low_line_count]
-            AggregateExec: mode=FinalPartitioned, gby=[l_shipmode@0 as l_shipmode], aggr=[SUM(CASE WHEN #orders.o_orderpriority Eq Utf8("1-URGENT") Or #orders.o_orderpriority Eq Utf8("2-HIGH") THEN Int64(1) ELSE Int64(0) END), SUM(CASE WHEN #orders.o_orderpriority NotEq Utf8("1-URGENT") And #orders.o_orderpriority NotEq Utf8("2-HIGH") THEN Int64(1) ELSE Int64(0) END)]
-              CoalesceBatchesExec: target_batch_size=4096
-                UnresolvedShuffleExec
-
-        ShuffleWriterExec: None
-          SortExec: [l_shipmode@0 ASC]
-            CoalescePartitionsExec
-              UnresolvedShuffleExec
+          SortPreservingMergeExec: [l_shipmode@0 ASC NULLS LAST]
+            UnresolvedShuffleExec
         */
 
         assert_eq!(5, stages.len());
@@ -537,7 +534,10 @@ order by
 
         let hash_agg = downcast_exec!(input, AggregateExec);
 
-        let coalesce_batches = hash_agg.children()[0].clone();
+        let projection = hash_agg.children()[0].clone();
+        let projection = downcast_exec!(projection, ProjectionExec);
+
+        let coalesce_batches = projection.children()[0].clone();
         let coalesce_batches = downcast_exec!(coalesce_batches, CoalesceBatchesExec);
 
         let join = coalesce_batches.children()[0].clone();
@@ -548,7 +548,6 @@ order by
         let join_input_1 = join_input_1.children()[0].clone();
         let unresolved_shuffle_reader_1 =
             downcast_exec!(join_input_1, UnresolvedShuffleExec);
-        assert_eq!(unresolved_shuffle_reader_1.input_partition_count, 2); // lineitem
         assert_eq!(unresolved_shuffle_reader_1.output_partition_count, 2);
 
         let join_input_2 = join.children()[1].clone();
@@ -556,7 +555,6 @@ order by
         let join_input_2 = join_input_2.children()[0].clone();
         let unresolved_shuffle_reader_2 =
             downcast_exec!(join_input_2, UnresolvedShuffleExec);
-        assert_eq!(unresolved_shuffle_reader_2.input_partition_count, 1); // orders
         assert_eq!(unresolved_shuffle_reader_2.output_partition_count, 2);
 
         // final partitioned hash aggregate

@@ -19,9 +19,9 @@ use crate::client::BallistaClient;
 use crate::config::BallistaConfig;
 use crate::serde::protobuf::execute_query_params::OptionalSessionId;
 use crate::serde::protobuf::{
-    execute_query_params::Query, job_status, scheduler_grpc_client::SchedulerGrpcClient,
-    ExecuteQueryParams, GetJobStatusParams, GetJobStatusResult, KeyValuePair,
-    PartitionLocation,
+    execute_query_params::Query, execute_query_result, job_status,
+    scheduler_grpc_client::SchedulerGrpcClient, ExecuteQueryParams, GetJobStatusParams,
+    GetJobStatusResult, PartitionLocation,
 };
 use crate::utils::create_grpc_client_connection;
 use datafusion::arrow::datatypes::SchemaRef;
@@ -33,7 +33,8 @@ use datafusion::logical_expr::LogicalPlan;
 use datafusion::physical_plan::expressions::PhysicalSortExpr;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
-    DisplayFormatType, ExecutionPlan, Partitioning, SendableRecordBatchStream, Statistics,
+    DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, SendableRecordBatchStream,
+    Statistics,
 };
 use datafusion_proto::logical_plan::{
     AsLogicalPlan, DefaultLogicalExtensionCodec, LogicalExtensionCodec,
@@ -119,6 +120,24 @@ impl<T: 'static + AsLogicalPlan> DistributedQueryExec<T> {
     }
 }
 
+impl<T: 'static + AsLogicalPlan> DisplayAs for DistributedQueryExec<T> {
+    fn fmt_as(
+        &self,
+        t: DisplayFormatType,
+        f: &mut std::fmt::Formatter,
+    ) -> std::fmt::Result {
+        match t {
+            DisplayFormatType::Default | DisplayFormatType::Verbose => {
+                write!(
+                    f,
+                    "DistributedQueryExec: scheduler_url={}",
+                    self.scheduler_url
+                )
+            }
+        }
+    }
+}
+
 impl<T: 'static + AsLogicalPlan> ExecutionPlan for DistributedQueryExec<T> {
     fn as_any(&self) -> &dyn Any {
         self
@@ -175,15 +194,7 @@ impl<T: 'static + AsLogicalPlan> ExecutionPlan for DistributedQueryExec<T> {
 
         let query = ExecuteQueryParams {
             query: Some(Query::LogicalPlan(buf)),
-            settings: self
-                .config
-                .settings()
-                .iter()
-                .map(|(k, v)| KeyValuePair {
-                    key: k.to_owned(),
-                    value: v.to_owned(),
-                })
-                .collect::<Vec<_>>(),
+            settings: vec![],
             optional_session_id: Some(OptionalSessionId::SessionId(
                 self.session_id.clone(),
             )),
@@ -197,22 +208,6 @@ impl<T: 'static + AsLogicalPlan> ExecutionPlan for DistributedQueryExec<T> {
 
         let schema = self.schema();
         Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
-    }
-
-    fn fmt_as(
-        &self,
-        t: DisplayFormatType,
-        f: &mut std::fmt::Formatter,
-    ) -> std::fmt::Result {
-        match t {
-            DisplayFormatType::Default => {
-                write!(
-                    f,
-                    "DistributedQueryExec: scheduler_url={}",
-                    self.scheduler_url
-                )
-            }
-        }
     }
 
     fn statistics(&self) -> Statistics {
@@ -241,6 +236,15 @@ async fn execute_query(
         .await
         .map_err(|e| DataFusionError::Execution(format!("{e:?}")))?
         .into_inner();
+
+    let query_result = match query_result.result.unwrap() {
+        execute_query_result::Result::Success(success_result) => success_result,
+        execute_query_result::Result::Failure(failure_result) => {
+            return Err(DataFusionError::Execution(format!(
+                "Fail to execute query due to {failure_result:?}"
+            )));
+        }
+    };
 
     assert_eq!(
         session_id, query_result.session_id,
